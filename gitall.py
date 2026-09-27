@@ -10,8 +10,9 @@ what they mean in git. A few commands get extra handling:
                   (pass any status option, e.g. -s, for plain git status)
   commit          previews what each repo would commit, asks once, then commits;
                   repos with nothing to commit are skipped; {repo} in the message
-                  becomes the repo's folder name; --dry-run only previews
-  push            only repos with unpushed commits; asks first
+                  becomes the repo's folder name; --dry-run only previews;
+                  without -m (or with -c, -e, --squash) git opens an editor per repo
+  push           only repos with unpushed commits; asks first
   pull            "already up to date" repos are listed on one line
   fetch           then shows ahead/behind per repo
   anything else   runs in every repo, repos with no output are left out;
@@ -219,6 +220,49 @@ def confirm(question, yes):
         sys.exit(1)
 
 
+COMMIT_VALUE = {"message", "file", "reuse-message", "reedit-message", "fixup", "squash", "template",
+                "author", "date", "cleanup", "trailer", "pathspec-from-file"}
+
+
+def commit_options(args):
+    """The options given to git commit, as {name: value}: short ones by letter ('m'),
+    long ones by name ('reedit-message'). Option values are not mistaken for options."""
+    opts, i = {}, 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            break
+        if a.startswith("--"):
+            name, eq, value = a[2:].partition("=")
+            if not eq and name in COMMIT_VALUE and i < len(args):
+                value, i = args[i], i + 1
+            opts[name] = value
+        elif a.startswith("-") and len(a) > 1:
+            for j, ch in enumerate(a[1:], 2):
+                opts[ch] = ""
+                if ch in "Su":  # optional value, only in this word (-S<keyid>, -u<mode>)
+                    opts[ch] = a[j:]
+                    break
+                if ch in "mFCct":  # takes a value: the rest of this word, or the next word
+                    opts[ch] = a[j:]
+                    if j == len(a) and i < len(args):
+                        opts[ch], i = args[i], i + 1
+                    break
+    return opts
+
+
+def commit_opens_editor(args):
+    """Whether git commit will open an editor for the message."""
+    opts = commit_options(args)
+    if "no-edit" in opts:
+        return False
+    fixup = opts.get("fixup", "")
+    if {"e", "edit", "c", "reedit-message"} & opts.keys() or fixup.startswith(("amend:", "reword:")):
+        return True
+    return not {"m", "message", "F", "file", "C", "reuse-message", "fixup"} & opts.keys()
+
+
 # ---- commands --------------------------------------------------------------------------
 class Run:
     def __init__(self, repos, yes):
@@ -260,12 +304,7 @@ class Run:
 
     def commit(self, args):
         user_dry = "--dry-run" in args
-        has_msg = any(
-            a in ("-m", "--message", "-F", "--file", "-C", "--reuse-message", "-c", "--reedit-message",
-                  "--no-edit", "--fixup", "--squash")
-            or a.startswith(("--message=", "--file=", "--reuse-message=", "--fixup=", "--squash="))
-            or (re.fullmatch(r"-[A-Za-z]+", a) and set(a[1:]) & set("mFCc"))
-            for a in args)
+        editor = commit_opens_editor(args)
         plan = []
         for r in self.repos:
             prob = problem(r)
@@ -292,11 +331,11 @@ class Run:
         if user_dry:
             out(f"(dry run: {len(plan)} repo(s) would be committed)")
             self.finish()
-        if not has_msg:
-            out(YELLOW("No -m message: git will open an editor for each repo."))
+        if editor:
+            out(YELLOW("git will open an editor for the message in each repo."))
         confirm(f"Commit {len(plan)} repo(s)?", self.yes)
         for r, rargs in plan:
-            rc, text = git(r, "commit", "-q", *rargs) if has_msg else git(r, "commit", *rargs, live=True)
+            rc, text = git(r, "commit", *rargs, live=True) if editor else git(r, "commit", "-q", *rargs)
             if rc == 0:
                 n = len((git_ok(r, "show", "--name-only", "--format=", "HEAD") or "").splitlines())
                 out(f"{r.name}: {GREEN('committed')} {git_ok(r, 'log', '-1', '--format=%h %s')} ({n} file(s))")

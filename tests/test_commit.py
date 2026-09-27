@@ -142,6 +142,19 @@ def test_no_message_opens_the_editor_in_each_repo(world, run, monkeypatch):
     assert last_message(a) == last_message(b) == "from-editor"
 
 
+@pytest.mark.parametrize("opts", [["-c", "HEAD"], ["--reedit-message=HEAD"], ["-m", "typed", "-e"],
+                                  ["--squash", "HEAD"], ["--fixup=amend:HEAD"]])
+def test_options_that_open_the_editor_run_attached(world, run, monkeypatch, opts):
+    monkeypatch.setenv("GIT_EDITOR", "echo from-editor >")
+    a = world.repo("A")
+    write(a / "main.tex", "changed\n")
+    git(a, "add", "-A")
+    r = run("commit", *opts, "-y", cwd=world.work)
+    assert r.code == 0, r
+    assert "open an editor" in r.out
+    assert "from-editor" in git(a, "log", "-1", "--format=%B")
+
+
 @pytest.mark.parametrize("opts", [["-C", "HEAD"], ["--fixup", "HEAD"], ["-c", "HEAD", "--no-edit"],
                                   ["-mEdited"], ["-F", "msg.txt"]])
 def test_options_that_give_the_message_dont_open_the_editor(world, run, opts):

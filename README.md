@@ -50,6 +50,7 @@ Put these **before** the git command.
   Give any option (e.g. `gitall status -s`) to get plain `git status` instead.
 - **commit**: previews each repo's commit and asks once. Repos with nothing to commit are skipped.
   `{repo}` in the message is replaced by the folder name. `--dry-run` only shows the preview.
+  Without `-m` (or with `-c`, `-e`, `--squash`), git opens an editor for each repo in turn.
 - **push**: only repos with unpushed commits, after a confirmation. If the remote has newer
   commits, it tells you to `pull` first.
 - **pull**: up-to-date repos are listed on one line; conflicts are reported, not resolved.
