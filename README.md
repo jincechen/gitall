@@ -83,6 +83,8 @@ Needs Python 3.8+ and git; `gitall.py` is a single file with no other dependenci
   (or any folder on your `PATH`).
 - Or run it directly: `python path/to/gitall.py status`.
 
+Renaming the file renames the tool: `multigit.py` reads `.multigit` and calls itself multigit.
+
 ## Tests
 
 The tests build throwaway repos, each with a bare repo as its remote (standing in for a

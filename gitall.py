@@ -69,7 +69,8 @@ def out(text=""):
 
 def die(msg, code=2):
     sys.stdout.flush()
-    sys.stderr.write(RED(f"{PROG}: {msg}") + "\n")
+    sys.stderr.buffer.write((RED(f"{PROG}: {msg}") + "\n").encode("utf-8", "replace"))
+    sys.stderr.flush()
     sys.exit(code)
 
 
@@ -454,6 +455,10 @@ class Run:
         self.finish()
 
 
+def usage():
+    return __doc__.strip().replace("gitall", PROG).replace(".gitall", CONFIG)
+
+
 def main(argv):
     filters, yes, start = [], False, Path.cwd()
     i = 0
@@ -482,7 +487,7 @@ def main(argv):
                 out(f"{n:3}  {r.name}")
             return 0
         elif a in ("-h", "--help"):
-            out(__doc__.strip())
+            out(usage())
             return 0
         elif a.startswith("-"):
             die(f"unknown option '{a}' ({PROG}'s own options go before the git command; see {PROG} -h)")
@@ -490,12 +495,12 @@ def main(argv):
             break
         i += 1
     if i >= len(argv):
-        out(__doc__.strip())
+        out(usage())
         return 2
     cmd, args = argv[i], argv[i + 1:]
     if cmd in ("help", "version"):
         if cmd == "help" and not args:
-            out(__doc__.strip())
+            out(usage())
             return 0
         return subprocess.call(["git", cmd, *args])  # once, not once per repo
     if cmd in ("commit", "push", "pull") or cmd not in NO_CONFIRM:

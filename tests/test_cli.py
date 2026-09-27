@@ -1,5 +1,11 @@
-"""Command line handling."""
-from conftest import write
+"""Command line handling, output encoding, the Windows launcher."""
+import os
+import shutil
+import subprocess
+
+import pytest
+
+from conftest import ROOT, write
 
 
 def test_no_command_prints_help(world, run):
@@ -48,7 +54,45 @@ def test_closed_stdin_in_a_real_process(world, run_script):
     assert "re-run with -y" in r.err
 
 
+def test_non_ascii_output_when_redirected(world, run_script):
+    # with a legacy console encoding, printing non-ASCII text used to raise UnicodeEncodeError
+    world.repo("讲义", {"Übung.tex": "x\n"})
+    env = {"PYTHONIOENCODING": "cp1252", "PYTHONUTF8": "0"}
+    r = run_script("ls-files", cwd=world.work, env=env)
+    assert r.code == 0, r
+    assert "== 讲义" in r.out and "Übung.tex" in r.out
+    r = run_script("-r", "zzz", "status", cwd=world.work, env=env)
+    assert r.code == 2, r
+    assert "(repos: 1:讲义)" in r.err
+
+
 def test_gitall_file_is_read_as_utf8(world, run):
     world.repo("Übung", remote=False)
     write(world.work / ".gitall", "Übung\n")
     assert "Übung" in run("-l", cwd=world.work).out
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher")
+def test_windows_launcher(world):
+    world.repo("A", remote=False)
+    cmd = str(ROOT / "gitall.cmd")
+    p = subprocess.run(["cmd", "/c", cmd, "-l"], cwd=world.work, capture_output=True)
+    assert p.returncode == 0 and b"A" in p.stdout
+    p = subprocess.run(["cmd", "/c", cmd, "-r", "zzz", "status"], cwd=world.work, capture_output=True)
+    assert p.returncode == 2  # the exit code gets through the .cmd
+
+
+def test_renaming_the_script_renames_messages_and_config(world, run_script, tmp_path):
+    for name in ("A", "B"):
+        world.repo(name, remote=False)
+    write(world.work / ".gitall", "A\n")
+    write(world.work / ".multigit", "B\n")
+    script = tmp_path / "bin" / "multigit.py"
+    script.parent.mkdir()
+    shutil.copy(ROOT / "gitall.py", script)
+    r = run_script("-l", cwd=world.work, script=script)
+    assert "(from .multigit)" in r.out and r.out.rstrip().endswith("B")
+    r = run_script("-h", cwd=world.work, script=script)
+    assert "Usage:  multigit" in r.out and ".multigit file" in r.out and "gitall" not in r.out
+    r = run_script("-r", "zzz", "status", cwd=world.work, script=script)
+    assert r.err.startswith("multigit: no repo matches")
