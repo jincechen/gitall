@@ -41,14 +41,43 @@ from pathlib import Path
 PROG = Path(__file__).stem              # rename the file and messages/config name follow
 CONFIG = f".{PROG}"
 
-# commands that never change anything: no confirmation needed
+# commands that only show things: no confirmation needed
 READ_ONLY = {
-    "status", "diff", "log", "show", "shortlog", "blame", "grep", "ls-files", "ls-tree",
-    "rev-parse", "rev-list", "describe", "reflog", "cat-file", "check-ignore", "name-rev",
-    "count-objects", "whatchanged", "fetch", "range-diff", "for-each-ref",
+    "status", "diff", "log", "show", "shortlog", "blame", "annotate", "grep", "ls-files",
+    "ls-tree", "ls-remote", "rev-parse", "rev-list", "describe", "cat-file", "check-ignore",
+    "check-attr", "check-mailmap", "check-ref-format", "name-rev", "count-objects",
+    "whatchanged", "fetch", "range-diff", "for-each-ref", "show-ref", "show-branch",
+    "merge-base", "cherry", "diff-tree", "diff-files", "diff-index", "var", "verify-commit",
+    "verify-tag", "fsck",
 }
-READ_ONLY |= {"stash list", "stash show", "branch list", "remote list", "config read"}
 NO_CONFIRM = READ_ONLY | {"add", "pull"}
+
+# options that make a command interactive (run attached to the terminal), per command;
+# the same letters mean something else elsewhere (log -p, grep -i, grep -e)
+INTERACTIVE = {
+    "add": {"-p", "--patch", "-i", "--interactive", "-e", "--edit"},
+    "checkout": {"-p", "--patch"}, "reset": {"-p", "--patch"}, "restore": {"-p", "--patch"},
+    "stash": {"-p", "--patch"}, "clean": {"-i", "--interactive"}, "rebase": {"-i", "--interactive"},
+    "merge": {"-e", "--edit"}, "revert": {"-e", "--edit"}, "cherry-pick": {"-e", "--edit"},
+    "tag": {"-e", "--edit"}, "config": {"-e", "--edit"}, "am": {"-i", "--interactive"},
+    "pull": {"--rebase=interactive", "--rebase=i", "-r=i", "-ri"},
+}
+# branch options that create, delete, rename or configure branches, and ones that list them
+BRANCH_CHANGES = {"--delete", "--move", "--copy", "--set-upstream-to", "--unset-upstream",
+                  "--edit-description", "--force", "--track", "--no-track", "--create-reflog"}
+BRANCH_LISTS = {"-l", "--list", "-v", "-vv", "--verbose", "--contains", "--no-contains",
+                "--merged", "--no-merged", "--points-at", "--show-current"}
+TAG_CHANGES = {"-d", "--delete", "-a", "--annotate", "-s", "--sign", "-u", "--local-user",
+               "-f", "--force", "-m", "--message", "-F", "--file", "-e", "--edit"}
+TAG_LISTS = {"-l", "--list", "--contains", "--no-contains", "--points-at", "--merged",
+             "--no-merged", "-v", "--verify"}
+CONFIG_READS = {"-l", "--list", "--get", "--get-all", "--get-regexp", "--get-urlmatch",
+                "--get-color", "--get-colorbool"}
+CONFIG_WRITES = {"--add", "--replace-all", "--unset", "--unset-all", "--rename-section",
+                 "--remove-section", "-e", "--edit"}
+# branch/tag options whose value is the next argument (branch --sort -committerdate)
+LIST_VALUES = {"--sort", "--format", "--contains", "--no-contains", "--merged", "--no-merged",
+               "--points-at", "-u", "--set-upstream-to", "-m", "--message", "-F", "--file"}
 
 TTY = sys.stdout.isatty()
 if os.name == "nt" and TTY:
@@ -221,6 +250,75 @@ def confirm(question, yes):
         sys.exit(1)
 
 
+def read_only(cmd, args):
+    """True if git <cmd> <args> only shows things (no confirmation needed)."""
+    if cmd in READ_ONLY:
+        return True
+    opts, words, i = [], [], 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a.startswith("-"):
+            opts.append(a.split("=", 1)[0])
+            if cmd in ("branch", "tag") and a in LIST_VALUES and i < len(args):
+                i += 1                      # its value (branch --sort -committerdate)
+        else:
+            words.append(a)
+    short = "".join(o[1:] for o in opts if not o.startswith("--"))
+    if cmd == "stash":
+        return bool(words) and words[0] in ("list", "show")
+    if cmd == "remote":
+        return (not words and set(opts) <= {"-v", "--verbose"}) or (bool(words) and words[0] in ("get-url", "show"))
+    if cmd == "branch":
+        if set(short) & set("dDmMcCuft") or set(opts) & BRANCH_CHANGES:
+            return False
+        return not words or bool(set(opts) & BRANCH_LISTS)
+    if cmd == "tag":
+        if set(opts) & TAG_CHANGES:
+            return False
+        return not words or bool(set(opts) & TAG_LISTS) or any(re.fullmatch(r"-n\d*", o) for o in opts)
+    if cmd == "config":
+        if words and words[0] in ("get", "list"):
+            return True
+        if set(opts) & CONFIG_WRITES or (words and words[0] in ("set", "unset", "rename-section",
+                                                                 "remove-section", "edit")):
+            return False
+        return bool(set(opts) & CONFIG_READS) or len(words) == 1  # git config <key> reads it
+    if cmd == "reflog":
+        return not words or words[0] not in ("expire", "delete", "drop")
+    if cmd == "worktree":
+        return bool(words) and words[0] == "list"
+    if cmd == "notes":
+        return not words or words[0] in ("list", "show")
+    if cmd == "submodule":
+        return not words or words[0] in ("status", "summary")
+    if cmd == "clean":
+        return ("n" in short or "--dry-run" in opts) and not interactive(cmd, args)
+    if cmd in ("rm", "mv"):
+        return "-n" in opts or "--dry-run" in opts
+    if cmd == "bisect":
+        return bool(words) and words[0] in ("log", "visualize", "view")
+    if cmd == "lfs":
+        return bool(words) and words[0] in ("ls-files", "status", "env", "version", "locks")
+    return False
+
+
+def interactive(cmd, args):
+    if cmd in ("mergetool", "difftool"):
+        return True
+    if cmd == "stash" and args and args[0] in ("list", "show"):
+        return False
+    if cmd == "config" and args and args[0] == "edit":
+        return True
+    if cmd == "notes" and args and args[0] == "edit":
+        return True
+    if cmd == "tag" and set(args) & {"-a", "--annotate", "-s", "--sign", "-u"} and \
+            not any(a in ("-m", "-F", "--message", "--file") or a.startswith(("-m", "-F", "--message=", "--file="))
+                    for a in args):
+        return True  # annotated tag without a message: git opens an editor
+    return bool(INTERACTIVE.get(cmd, set()) & set(args))
+
+
 COMMIT_VALUE = {"message", "file", "reuse-message", "reedit-message", "fixup", "squash", "template",
                 "author", "date", "cleanup", "trailer", "pathspec-from-file"}
 
@@ -387,6 +485,7 @@ class Run:
         self.finish()
 
     def pull(self, args):
+        live = interactive("pull", args)
         uptodate = []
         for r in self.repos:
             prob = problem(r)
@@ -394,12 +493,15 @@ class Run:
                 self.skipped.append(f"{r.name}: {prob}")
                 continue
             before = git_ok(r, "rev-parse", "-q", "HEAD")
-            rc, text = git(r, "pull", "--no-edit", *args)
+            if live:
+                header(r.name)
+            rc, text = git(r, "pull", "--no-edit", *args, live=live)
             if rc == 0 and git_ok(r, "rev-parse", "-q", "HEAD") == before:
                 uptodate.append(r.name)
                 continue
-            header(r.name)
-            out(text)
+            if not live:
+                header(r.name)
+                out(text)
             if rc != 0:
                 if git_path(r, "MERGE_HEAD").exists():
                     self.failed.append(f"{r.name}: CONFLICT -- fix the files listed above, then "
@@ -424,21 +526,14 @@ class Run:
         self.finish()
 
     def passthrough(self, cmd, args):
-        interactive = cmd in ("mergetool", "difftool") or \
-            any(a in ("-p", "--patch", "-i", "--interactive", "-e", "--edit") for a in args)
-        key = cmd
-        if cmd in ("stash", "branch", "remote"):
-            listing = not args or all(a in ("-a", "-r", "-v", "-vv", "--list", "--all") for a in args)
-            key = f"{cmd} list" if listing and cmd != "stash" else f"{cmd} {args[0] if args else 'push'}"
-        if cmd == "config" and args and args[0] in ("-l", "--list", "--get", "--get-all", "--get-regexp"):
-            key = "config read"
-        if key not in NO_CONFIRM:
+        live, shows = interactive(cmd, args), read_only(cmd, args)
+        if not (shows or cmd in NO_CONFIRM):
             out(f"Will run:  git {' '.join([cmd, *args])}")
             out(f"in: {' '.join(r.name for r in self.repos)}")
             confirm("Continue?", self.yes)
         printed = False
         for r in self.repos:
-            if interactive:
+            if live:
                 header(r.name)
                 rc, _ = git(r, cmd, *args, live=True)
             else:
@@ -450,8 +545,8 @@ class Run:
             # exit 1 from grep / diff --exit-code means "no match" / "has differences", not failure
             if rc and not (rc == 1 and (cmd == "grep" or (cmd == "diff" and {"--exit-code", "--quiet"} & set(args)))):
                 self.failed.append(f"{r.name}: git {cmd} exited with {rc}")
-        if not printed and not interactive:
-            out("(no output)" if key in READ_ONLY else f"done in {len(self.repos)} repo(s)")
+        if not printed and not live:
+            out("(no output)" if shows else f"done in {len(self.repos)} repo(s)")
         self.finish()
 
 

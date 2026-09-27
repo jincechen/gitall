@@ -74,15 +74,43 @@ def test_one_failure_does_not_stop_the_others(world, run):
     assert "Failed:\n  A: git rev-parse exited with 1" in r.out
 
 
-def test_branch_config_stash_changes_ask(world, run):
+def test_changes_ask(world, run):
     a = world.repo("A")
     git(a, "branch", "old")
     write(a / "main.tex", "changed\n")
     for argv in (["branch", "-d", "old"], ["branch", "new"], ["config", "user.name", "X"],
-                 ["stash"], ["stash", "pop"], ["remote", "remove", "origin"]):
+                 ["stash"], ["stash", "pop"], ["remote", "remove", "origin"],
+                 ["reflog", "expire", "--expire=now", "--all"], ["reflog", "delete", "HEAD@{0}"],
+                 ["tag", "v1"], ["clean", "-fd"], ["worktree", "prune"]):
         r = run(*argv, cwd=world.work, tty=False)
         assert r.code == 2 and "Will run" in r.out, argv
     assert "old" in git(a, "branch")
+    assert git(a, "reflog") != ""
+
+
+def test_reflog_listing_does_not_ask(world, run):
+    world.repo("A")
+    for argv in (["reflog"], ["reflog", "-1"], ["reflog", "show", "-1"]):
+        r = run(*argv, cwd=world.work, tty=False)
+        assert r.code == 0 and "Will run" not in r.out, argv
+
+
+def test_read_only_commands_do_not_ask(world, run):
+    a = world.repo("A")
+    git(a, "tag", "v1")
+    write(a / "junk.tmp")
+    for argv in (["branch", "--show-current"], ["branch", "-a"], ["branch", "-vv"],
+                 ["remote", "-v"], ["remote", "get-url", "origin"],
+                 ["config", "user.name"], ["config", "--get", "user.name"], ["config", "-l"],
+                 ["stash", "list"], ["tag"], ["tag", "-l"], ["tag", "-n"],
+                 ["show-ref"], ["ls-remote", "origin"], ["merge-base", "HEAD", "HEAD"],
+                 ["worktree", "list"], ["clean", "-n"], ["rm", "-n", "main.tex"]):
+        r = run(*argv, cwd=world.work, tty=False)
+        assert r.code == 0, (argv, r)
+        assert "Will run" not in r.out, argv
+    assert (a / "junk.tmp").exists() and (a / "main.tex").exists()
+    assert "main" in run("branch", "--show-current", cwd=world.work).out
+    assert "Test" in run("config", "user.name", cwd=world.work).out
 
 
 def test_stash_show_patch_does_not_ask(world, run):
@@ -97,3 +125,19 @@ def test_non_ascii_filenames_are_not_quoted(world, run):
     world.repo("A", {"Übung_讲义.tex": "x\n"})
     r = run("ls-files", cwd=world.work)
     assert "Übung_讲义.tex" in r.out and "\\" not in r.out
+
+
+def test_log_patch_is_captured_not_interactive(world, run):
+    world.repo("A")
+    world.repo("B")
+    world.local_commit("B", {"x.tex": "slide\n"})
+    r = run("log", "-p", "@{u}..HEAD", cwd=world.work)
+    assert headers(r) == ["B"]
+    assert "+slide" in r.out
+
+
+def test_grep_ignore_case_and_pattern_are_captured(world, run):
+    world.repo("A", {"main.tex": "Hello\n"})
+    world.repo("B")
+    assert headers(run("grep", "-i", "hello", cwd=world.work)) == ["A"]
+    assert headers(run("grep", "-e", "Hello", cwd=world.work)) == ["A"]
