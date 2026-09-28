@@ -6,12 +6,27 @@ def headers(result):
     return [ln[3:] for ln in result.out.splitlines() if ln.startswith("== ")]
 
 
-def test_output_per_repo(world, run):
+def shown_repos(result):
+    """The repos that printed something: block headers, or the names starting compact rows."""
+    if headers(result):
+        return headers(result)
+    return [ln.split()[0] for ln in result.out.splitlines() if ln.strip()]
+
+
+def test_one_line_per_repo_prints_aligned_rows(world, run):
     world.repo("A")
-    world.repo("B")
+    world.repo("Bee")
     r = run("log", "-1", "--format=%s", cwd=world.work)
     assert r.code == 0
-    assert r.out.strip() == "== A\ninitial\n\n== B\ninitial"
+    assert r.out.strip() == "A    initial\nBee  initial"
+
+
+def test_longer_output_prints_blocks(world, run):
+    world.repo("A")
+    world.repo("B")
+    world.local_commit("B", {"x.tex": "x"}, "second")
+    r = run("log", "-2", "--format=%s", cwd=world.work)
+    assert r.out.strip() == "== A\ninitial\n\n== B\nsecond\ninitial"
 
 
 def test_repos_without_output_are_left_out(world, run):
@@ -19,7 +34,16 @@ def test_repos_without_output_are_left_out(world, run):
     world.repo("B")
     world.local_commit("B", {"x.tex": "x"}, "Unpushed")
     r = run("log", "--format=%s", "@{u}..HEAD", cwd=world.work)
-    assert headers(r) == ["B"]
+    assert r.out.strip() == "B  Unpushed"
+
+
+def test_git_messages_go_to_stderr(world, run):
+    world.repo("A")
+    world.repo("B")
+    r = run("-y", "branch", "-d", "no-such-branch", cwd=world.work)
+    assert r.code == 1
+    assert "error: branch 'no-such-branch' not found" in r.err
+    assert "not found" not in r.out
 
 
 def test_no_output_at_all(world, run):
@@ -70,7 +94,7 @@ def test_one_failure_does_not_stop_the_others(world, run):
     git(b, "branch", "feature")
     r = run("rev-parse", "--verify", "-q", "feature", cwd=world.work)
     assert r.code == 1
-    assert headers(r) == ["B"]
+    assert shown_repos(r)[:1] == ["B"]
     assert "Failed:\n  A: git rev-parse exited with 1" in r.out
 
 
@@ -139,5 +163,5 @@ def test_log_patch_is_captured_not_interactive(world, run):
 def test_grep_ignore_case_and_pattern_are_captured(world, run):
     world.repo("A", {"main.tex": "Hello\n"})
     world.repo("B")
-    assert headers(run("grep", "-i", "hello", cwd=world.work)) == ["A"]
-    assert headers(run("grep", "-e", "Hello", cwd=world.work)) == ["A"]
+    assert shown_repos(run("grep", "-i", "hello", cwd=world.work)) == ["A"]
+    assert shown_repos(run("grep", "-e", "Hello", cwd=world.work)) == ["A"]

@@ -121,7 +121,7 @@ def test_pull_conflict_is_reported_and_then_blocks_commit(world, run):
     assert "CONFLICT" in r.out
     assert "A: CONFLICT -- fix the files listed above" in r.out
     assert (a / ".git" / "MERGE_HEAD").exists()
-    assert "! merge in progress" in run("status", cwd=world.work).out
+    assert "MERGE IN PROGRESS" in run("status", cwd=world.work).out
     r = run("commit", "-am", "x", "-y", cwd=world.work)
     assert "A: merge in progress" in r.out
 

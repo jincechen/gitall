@@ -1,13 +1,14 @@
 # gitall
 
 Run git in several repositories at once. If you know git, you already know the syntax:
+type `gitall` where you would type `git`.
 
 ```
 gitall [options] <git command> [git arguments]
 ```
 
 ```
-gitall status                      # every repo: branch, ahead/behind, changed files
+gitall status                      # one line per repo: branch, ahead/behind, changes
 gitall diff --stat                 # any git diff options
 gitall add -A
 gitall commit -m "Fix typos"       # shows what each repo will commit, asks once, commits
@@ -46,8 +47,9 @@ Put these **before** the git command.
 
 ## What's different from plain git
 
-- **status**: one compact block per repo; clean repos are listed on one line.
-  Give any option (e.g. `gitall status -s`) to get plain `git status` instead.
+- **status**: one line per repo (branch, ahead/behind, changes, merge/rebase in progress),
+  then the changed files of each repo (up to 10). A repo without an upstream is never shown
+  as "clean". Give any option (e.g. `gitall status -s`) to get plain `git status` instead.
 - **commit**: previews each repo's commit and asks once. Repos with nothing to commit are skipped.
   `{repo}` in the message is replaced by the folder name. `--dry-run` only shows the preview.
   Without `-m` (or with `-c`, `-e`, `--squash`), git opens an editor for each repo in turn.
@@ -55,8 +57,9 @@ Put these **before** the git command.
   commits, it tells you to `pull` first.
 - **pull**: up-to-date repos are listed on one line; conflicts are reported, not resolved.
 - **fetch**: shows ahead/behind for each repo afterwards.
-- **Anything else** runs in every repo; repos with no output are left out. Commands that change
-  things (`checkout`, `reset`, `clean`, `merge`, ...) show what will run and ask first.
+- **Anything else** runs in every repo. If each repo prints one line, you get one aligned
+  line per repo; otherwise each repo's output under its name; repos with no output are left
+  out. Commands that change things show what will run and ask first.
 - A repo in the middle of a merge or rebase, on a detached HEAD, or with a leftover
   `index.lock` is skipped for commit/push/pull, with the reason shown.
 - One repo failing doesn't stop the others; failures are listed at the end (exit code 1).
