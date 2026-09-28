@@ -62,7 +62,8 @@ Put these **before** the git command.
   out. Commands that change things show what will run and ask first.
 - A repo in the middle of a merge or rebase, on a detached HEAD, or with a leftover
   `index.lock` is skipped for commit/push/pull, with the reason shown.
-- One repo failing doesn't stop the others; failures are listed at the end (exit code 1).
+- One repo failing doesn't stop the others. At the end, failures are listed (identical errors
+  together) with a `retry:` command line for just those repos; the exit code is 1.
 
 ## Examples
 

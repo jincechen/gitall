@@ -43,7 +43,7 @@ def test_git_messages_go_to_stderr(world, run):
     r = run("-y", "branch", "-d", "no-such-branch", cwd=world.work)
     assert r.code == 1
     assert "error: branch 'no-such-branch' not found" in r.err
-    assert "not found" not in r.out
+    assert "A, B: error: branch 'no-such-branch' not found" in r.out  # same error, grouped
 
 
 def test_no_output_at_all(world, run):
@@ -66,7 +66,7 @@ def test_changes_with_yes(world, run):
     world.repo("B")
     r = run("-y", "tag", "v1", cwd=world.work)
     assert r.code == 0
-    assert "done in 2 repo(s)" in r.out
+    assert "done in 2 repos" in r.out
     assert git(world.work / "B", "tag") == "v1"
 
 
@@ -96,6 +96,7 @@ def test_one_failure_does_not_stop_the_others(world, run):
     assert r.code == 1
     assert shown_repos(r)[:1] == ["B"]
     assert "Failed:\n  A: git rev-parse exited with 1" in r.out
+    assert "retry:  gitall -r A rev-parse --verify -q feature" in r.out
 
 
 def test_changes_ask(world, run):

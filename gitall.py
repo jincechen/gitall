@@ -127,6 +127,10 @@ def quote(arg):
     return '"' + arg.replace('"', '\\"') + '"'
 
 
+def shown(args):
+    return " ".join(quote(a) for a in args)
+
+
 def plural(n, word):
     return f"{n} {word}" + ("" if n == 1 else "s")
 
@@ -612,33 +616,66 @@ def repo_row(repo, width, bwidth, changes=True):
 
 
 class Run:
-    def __init__(self, ws, repos, o):
-        self.ws, self.repos, self.o = ws, repos, o
-        self.failed, self.skipped = [], []
+    def __init__(self, ws, repos, o, gitcmd):
+        self.ws, self.repos, self.o, self.gitcmd = ws, repos, o, gitcmd
+        self.failed, self.skipped, self.tally, self.code = [], [], {}, 0
         self.width = max((len(r.name) for r in repos), default=0)
 
     # -- bookkeeping
     def skip(self, repo, why):
         self.skipped.append((repo, why))
 
-    def fail(self, repo, msg):
-        self.failed.append((repo, msg))
+    def fail(self, repo, msg, retry=None):
+        self.failed.append((repo, msg, retry))
 
-    def finish(self):
-        for title, items, col in (("Skipped:", self.skipped, YELLOW), ("Failed:", self.failed, RED)):
-            if items:
+    def count(self, outcome, repo):
+        self.tally.setdefault(outcome, []).append(repo)
+
+    def finish(self, label=None):
+        if self.skipped:
+            out()
+            out(YELLOW("Skipped:"))
+            for r, why in self.skipped:
+                out(f"  {r.name}: {why}")
+        if self.failed:
+            out()
+            out(RED("Failed:"))
+            by_msg = {}
+            for r, msg, _ in self.failed:
+                by_msg.setdefault(msg, []).append(r)
+            for msg, rs in by_msg.items():
+                if len(rs) == 1:
+                    out(f"  {rs[0].name}: {msg}")
+                else:
+                    out(f"  {', '.join(r.name for r in rs)}: {msg}")
+            by_retry = {}
+            for r, _, retry in self.failed:
+                if retry is not False:
+                    by_retry.setdefault(tuple(retry or self.gitcmd), []).append(r)
+            for argv, rs in by_retry.items():
+                out(f"  retry:  {self.command_line(rs, argv)}")
+        if label and len(self.repos) > 1:
+            parts = [f"{len(v)} {k}" for k, v in self.tally.items() if v]
+            parts += [f"{len(self.failed)} failed"] * bool(self.failed)
+            parts += [f"{len(self.skipped)} skipped"] * bool(self.skipped)
+            if parts:
                 out()
-                out(col(title))
-                for r, msg in items:
-                    out(f"  {r.name}: {msg}")
-        sys.exit(1 if self.failed else 0)
+                out(f"{label}: {', '.join(parts)}")
+        sys.exit(1 if self.failed else self.code)
+
+    def command_line(self, repos, argv):
+        where = ["-C", quote(str(self.o.start))] if key(self.o.start) != key(Path.cwd()) else []
+        return " ".join([PROG, *where, "-r", quote(",".join(r.name for r in repos)),
+                         *(quote(a) for a in argv)])
 
     def plan(self):
         """The repos that are safe to change; skips the others."""
         res = []
         for r in self.repos:
             prob = r.state.problem()
-            if prob:
+            if prob and r.state.error:
+                self.fail(r, prob, False)      # not a repo git can read
+            elif prob:
                 self.skip(r, prob)
             else:
                 res.append(r)
@@ -689,36 +726,37 @@ class Run:
             if res.rc != 0:  # nothing to commit here -- unless git reported a real error
                 if re.search(r"^(fatal|error):", res.err, re.M) and \
                         "did not match any file(s) known to git" not in res.err:
-                    header(r.name)
-                    out(res.err)
-                    self.fail(r, "git commit failed")
+                    self.fail(r, first_error(res))
                 continue
             todo.append((r, rargs))
             s = r.state
             header(f"{r.name} ({branch_text(s)}{', ' + sync_text(s) if sync_text(s) else ''})")
             out("\n".join(ln for ln in res.out.splitlines() if ln[:1] not in (" ", "?")))
         if not todo:
-            out("nothing to commit (stage changes with  git add  first, or use  commit -a  or  commit -- <paths>)")
+            if not self.failed:
+                out("nothing to commit (stage changes with  git add  first, or use  commit -a  or  "
+                    "commit -- <paths>)")
             self.finish()
         out()
         if user_dry:
-            out(f"(dry run: {len(todo)} repo(s) would be committed)")
+            out(f"(dry run: {plural(len(todo), 'repo')} would be committed)")
             self.finish()
         if editor:
             out(YELLOW("git will open an editor for the message in each repo."))
-        confirm(f"Commit {len(todo)} repo(s)?", self.o.yes)
+        confirm(f"Commit {plural(len(todo), 'repo')}?", self.o.yes)
         for r, rargs in todo:
             res = git(r.path, "commit", *rargs, live=True) if editor else git(r.path, "commit", "-q", *rargs)
             if res.rc == 0:
                 n = len((git_ok(r.path, "show", "--name-only", "--format=", "HEAD") or "").splitlines())
                 out(f"{r.name}: {GREEN('committed')} {git_ok(r.path, 'log', '-1', '--format=%h %s')} "
                     f"({n} file(s))")
+                self.count("committed", r)
             else:
                 out(f"{r.name}: {RED('commit failed')}")
                 if res.out or res.err:
                     out(indent("\n".join(t for t in (res.out, res.err) if t)))
-                self.fail(r, "commit failed")
-        self.finish()
+                self.fail(r, first_error(res))
+        self.finish("commit")
 
     # -- push
     def push(self, args):
@@ -732,6 +770,7 @@ class Run:
                     self.skip(r, "no upstream branch (git push -u origin <branch>)")
                     continue
                 if not s.ahead:
+                    self.count("up to date", r)
                     continue
                 header(f"{r.name} ({branch_text(s)}, {sync_text(s)})")
                 out(git_ok(r.path, "log", "--format=  %h %s", "@{u}..HEAD") or "")
@@ -741,20 +780,21 @@ class Run:
             self.finish()
         if not user_dry:
             out()
-            confirm(f"Push {len(todo)} repo(s)?", self.o.yes)
+            confirm(f"Push {plural(len(todo), 'repo')}?", self.o.yes)
         for r in todo:
             res = git(r.path, "push", *args)
             text = "\n".join(t for t in (res.out, res.err) if t)
             if res.rc == 0:
                 out(f"{r.name}: {text}" if user_dry else f"{r.name}: {GREEN('pushed')}")
+                self.count("pushed", r)
             elif re.search(r"rejected|fetch first|non-fast-forward", text):
                 out(f"{r.name}: {RED('rejected')}")
-                self.fail(r, f"the remote has newer commits -> {PROG} -r {r.name} pull, then push again")
+                self.fail(r, "rejected: the remote has newer commits (pull first, then push again)", ["pull"])
             else:
                 out(f"{r.name}: {RED('push failed')}")
                 out(indent(text))
-                self.fail(r, "push failed")
-        self.finish()
+                self.fail(r, first_error(res))
+        self.finish("push")
 
     # -- pull
     def pull(self, args):
@@ -768,20 +808,22 @@ class Run:
             r.refresh()
             if res.rc == 0 and r.state.oid == before:
                 uptodate.append(r.name)
+                self.count("up to date", r)
                 continue
             if not live:
                 header(r.name)
                 out("\n".join(t for t in (res.out, res.err) if t))
-            if res.rc != 0:
-                if r.state.op == "merge":
-                    self.fail(r, "CONFLICT -- fix the files listed above, then git add <files> and "
-                                 "git commit --no-edit")
-                else:
-                    self.fail(r, "pull failed (if local changes block it, commit them first)")
+            if res.rc == 0:
+                self.count("updated", r)
+            elif r.state.op == "merge":
+                self.fail(r, "CONFLICT -- fix the files listed above, then git add <files> and "
+                             "git commit --no-edit", False)
+            else:
+                self.fail(r, first_error(res))
         if uptodate:
             out()
             out(f"{GREEN('up to date:')} {' '.join(uptodate)}")
-        self.finish()
+        self.finish("pull")
 
     # -- fetch
     def fetch(self, args):
@@ -794,14 +836,14 @@ class Run:
             else:
                 out(f"{r.name}: {RED('fetch failed')}")
                 out(indent(res.err or res.out))
-                self.fail(r, "fetch failed")
+                self.fail(r, first_error(res))
         self.finish()
 
     # -- everything else
     def passthrough(self, cmd, args):
         live, shows = interactive(cmd, args), read_only(cmd, args)
         if not (shows or cmd in NO_CONFIRM):
-            out(f"Will run:  git {' '.join([cmd, *args])}")
+            out(f"Will run:  git {shown([cmd, *args])}")
             out(f"in: {' '.join(r.name for r in self.repos)}")
             confirm("Continue?", self.o.yes)
         blocks = Blocks()
@@ -814,10 +856,10 @@ class Run:
                 blocks.add(r, res)
             # exit 1 from grep / diff --exit-code means "no match" / "has differences", not failure
             if res.rc and not (res.rc == 1 and (cmd == "grep" or (cmd == "diff" and {"--exit-code", "--quiet"} & set(args)))):
-                self.fail(r, f"git {cmd} exited with {res.rc}")
+                self.fail(r, first_error(res) if res.err else f"git {cmd} exited with {res.rc}")
         blocks.close()
         if not blocks.printed and not live:
-            out("(no output)" if shows else f"done in {len(self.repos)} repo(s)")
+            out("(no output)" if shows else f"done in {plural(len(self.repos), 'repo')}")
         self.finish()
 
 
@@ -884,7 +926,7 @@ def main(argv):
     if not ws.repos:
         die(f"no git repos found in {ws.root} (run it in or inside the folder that contains "
             f"your repos, or list them in a {CONFIG} file)")
-    run = Run(ws, select(ws, o.picks), o)
+    run = Run(ws, select(ws, o.picks), o, [cmd, *args])
     handler = {"status": run.status, "commit": run.commit, "push": run.push,
                "pull": run.pull, "fetch": run.fetch}.get(cmd)
     if handler:
