@@ -50,7 +50,7 @@ def test_dry_run_only_previews(world, run):
     before = world.head("A")
     r = run("commit", "-m", "x", "--dry-run", cwd=world.work, tty=False)
     assert r.code == 0
-    assert "A  intro.tex" in r.out and "(dry run: 1 repo(s) would be committed)" in r.out
+    assert "A  intro.tex" in r.out and "(dry run: 1 repo would be committed)" in r.out
     assert world.head("A") == before
 
 
@@ -87,13 +87,13 @@ def test_pathspec_commits_matching_files_and_no_match_is_not_an_error(world, run
     assert last_message(b) == "initial"
 
 
-def test_a_real_git_error_is_reported(world, run):
+def test_a_real_git_error_is_reported_with_gits_message(world, run):
     world.repo("A")
     write(world.work / "A" / "main.tex", "changed\n")
     r = run("commit", "-am", "x", "--no-such-option", "-y", cwd=world.work)
     assert r.code == 1
-    assert "unknown option" in r.out
-    assert "A: git commit failed" in r.out
+    assert "Failed:\n  A: error: unknown option `no-such-option'" in r.out
+    assert "nothing to commit" not in r.out
 
 
 def test_answer_no_aborts(world, run):
@@ -101,7 +101,7 @@ def test_answer_no_aborts(world, run):
     before = world.head("A")
     r = run("commit", "-m", "x", cwd=world.work, answer="n")
     assert r.code == 1
-    assert "Commit 1 repo(s)? [y/N]" in r.out and "aborted, nothing changed" in r.out
+    assert "Commit 1 repo? [y/N]" in r.out and "aborted, nothing changed" in r.out
     assert world.head("A") == before
 
 

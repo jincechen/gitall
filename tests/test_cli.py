@@ -43,7 +43,7 @@ def test_yes_after_the_git_command(world, run):
     world.repo("A")
     r = run("tag", "v1", "-y", cwd=world.work, tty=False)
     assert r.code == 0, r
-    assert "done in 1 repo(s)" in r.out
+    assert "done in 1 repo" in r.out
 
 
 def test_closed_stdin_in_a_real_process(world, run_script):

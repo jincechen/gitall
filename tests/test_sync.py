@@ -65,7 +65,9 @@ def test_rejected_push_suggests_pull_and_others_still_push(world, run):
     r = run("push", "-y", cwd=world.work)
     assert r.code == 1
     assert "A: rejected" in r.out and "B: pushed" in r.out
-    assert "A: the remote has newer commits -> gitall -r A pull, then push again" in r.out
+    assert "A: rejected: the remote has newer commits (pull first, then push again)" in r.out
+    assert "retry:  gitall -r A pull" in r.out
+    assert "push: 1 pushed, 1 failed" in r.out
 
 
 def test_rejected_then_pull_then_push(world, run):
@@ -108,6 +110,7 @@ def test_pull_brings_in_overleaf_edits_and_lists_up_to_date_repos(world, run):
     r = run("pull", cwd=world.work, tty=False)  # pull doesn't ask
     assert r.code == 0, r
     assert "== B" in r.out and "up to date: A C" in r.out
+    assert "pull: 2 up to date, 1 updated" in r.out
     assert world.head("B") == world.remote_head("B")
 
 
@@ -120,6 +123,7 @@ def test_pull_conflict_is_reported_and_then_blocks_commit(world, run):
     assert r.code == 1
     assert "CONFLICT" in r.out
     assert "A: CONFLICT -- fix the files listed above" in r.out
+    assert "retry:" not in r.out
     assert (a / ".git" / "MERGE_HEAD").exists()
     assert "MERGE IN PROGRESS" in run("status", cwd=world.work).out
     r = run("commit", "-am", "x", "-y", cwd=world.work)
@@ -132,7 +136,7 @@ def test_pull_blocked_by_local_changes(world, run):
     write(a / "main.tex", "uncommitted local\n")
     r = run("pull", cwd=world.work)
     assert r.code == 1
-    assert "A: pull failed (if local changes block it, commit them first)" in r.out
+    assert "A: error: Your local changes to the following files would be overwritten" in r.out
     assert not (a / ".git" / "MERGE_HEAD").exists()
 
 
@@ -166,4 +170,5 @@ def test_fetch_failure_does_not_stop_the_others(world, run):
     r = run("fetch", cwd=world.work)
     assert r.code == 1
     assert "behind 1" in r.out
-    assert "B: fetch failed" in r.out and "Failed:\n  B: fetch failed" in r.out
+    assert "B: fetch failed" in r.out and "Failed:\n  B: fatal: " in r.out
+    assert "retry:  gitall -r B fetch" in r.out
