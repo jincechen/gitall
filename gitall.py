@@ -91,6 +91,7 @@ def _c(code):
 BOLD, RED, GREEN, YELLOW = _c("1"), _c("31"), _c("32"), _c("33")
 
 
+# ---- output --------------------------------------------------------------------------
 def out(text=""):
     sys.stdout.buffer.write((text + "\n").encode("utf-8", "replace"))
     sys.stdout.flush()
@@ -105,129 +106,6 @@ def die(msg, code=2):
 
 def indent(text):
     return "    " + text.replace("\n", "\n    ")
-
-
-def git(repo, *args, live=False, colour=False, stderr=True):
-    """Run git in repo -> (returncode, output). stderr=False drops warnings (for parsing);
-    live=True runs attached to the terminal (editors, interactive prompts)."""
-    cmd = ["git", "-c", "core.quotePath=false"]
-    if colour and TTY:
-        cmd += ["-c", "color.ui=always"]
-    cmd += ["--no-pager", *args]
-    if live:
-        return subprocess.call(cmd, cwd=repo), ""
-    p = subprocess.run(cmd, cwd=repo, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT if stderr else subprocess.DEVNULL)
-    return p.returncode, p.stdout.decode("utf-8", "replace").rstrip("\n")
-
-
-def git_ok(repo, *args):
-    rc, text = git(repo, *args, stderr=False)
-    return text if rc == 0 else None
-
-
-# ---- which repos ---------------------------------------------------------------------
-def natural(name):
-    return [int(s) if s.isdigit() else s.lower() for s in re.split(r"(\d+)", name)]
-
-
-def is_repo(p):
-    return p.is_dir() and (p / ".git").exists()
-
-
-def find_repos(start):
-    """Where the repos are, like git finds its repo from any subfolder:
-    1. the repos listed in the nearest .gitall file (start or a parent folder);
-    2. else the git repos directly inside start;
-    3. else, if start is inside a repo, that repo and its sibling repos."""
-    for d in [start, *start.parents]:
-        cfg = d / CONFIG
-        if cfg.is_file():
-            repos = []
-            subdirs = sorted((p for p in d.iterdir() if p.is_dir()), key=lambda p: natural(p.name))
-            for n, line in enumerate(cfg.read_text(encoding="utf-8").splitlines(), 1):
-                entry = line.split("#", 1)[0].strip().rstrip("/\\")
-                if not entry:
-                    continue
-                if any(ch in entry for ch in "*?["):
-                    hits = [p for p in subdirs if fnmatch.fnmatchcase(p.name, entry) and is_repo(p)]
-                else:
-                    hits = [d / entry] if is_repo(d / entry) else []
-                if not hits:
-                    die(f"{cfg}, line {n}: '{entry}' is not a git repo")
-                repos += [p for p in hits if p not in repos]
-            return d, repos
-
-    def repos_in(d):
-        return sorted((p for p in d.iterdir() if is_repo(p)), key=lambda p: natural(p.name))
-
-    repos = repos_in(start)
-    if repos:
-        return start, repos
-    top = git_ok(start, "rev-parse", "--show-toplevel")
-    if top:
-        parent = Path(top).resolve().parent
-        return parent, repos_in(parent)
-    return start, []
-
-
-def select_repos(start, filters):
-    root, repos = find_repos(start)
-    if not repos:
-        die(f"no git repos found in {root} (run it in or inside the folder that contains "
-            f"your repos, or list them in a {CONFIG} file)")
-    if not filters:
-        return repos
-    chosen = []
-    for f in filters:
-        if f.isdigit():
-            hits = [repos[int(f) - 1]] if 1 <= int(f) <= len(repos) else []
-        else:
-            hits = [r for r in repos if f.lower() in r.name.lower()]
-        if not hits:
-            listing = ", ".join(f"{i}:{r.name}" for i, r in enumerate(repos, 1))
-            die(f"no repo matches '{f}' (repos: {listing})")
-        chosen += [r for r in hits if r not in chosen]
-    return [r for r in repos if r in chosen]
-
-
-# ---- repo state ----------------------------------------------------------------------
-def git_path(repo, name):
-    p = git_ok(repo, "rev-parse", "--git-path", name)
-    return (repo / p) if p else repo / ".git" / name
-
-
-def problem(repo):
-    """Why it isn't safe to commit/pull/push here right now, or None."""
-    lock = git_path(repo, "index.lock")
-    if lock.exists():
-        return f"index.lock exists (another git or editor running? if not, delete {lock})"
-    if git_path(repo, "MERGE_HEAD").exists():
-        return "merge in progress (fix conflicts and commit, or git merge --abort)"
-    if git_path(repo, "rebase-merge").exists() or git_path(repo, "rebase-apply").exists():
-        return "rebase in progress (git rebase --continue or --abort)"
-    if git_path(repo, "CHERRY_PICK_HEAD").exists():
-        return "cherry-pick in progress"
-    if git_ok(repo, "symbolic-ref", "-q", "HEAD") is None:
-        return "detached HEAD (git switch <branch>)"
-    return None
-
-
-def ahead_behind(repo):
-    """(ahead, behind) vs upstream as of the last fetch, or None if no upstream."""
-    if git_ok(repo, "rev-parse", "--abbrev-ref", "-q", "@{u}") is None:
-        return None
-    counts = git_ok(repo, "rev-list", "--left-right", "--count", "HEAD...@{u}")
-    return tuple(int(x) for x in counts.split()) if counts else (0, 0)
-
-
-def branch_info(repo):
-    branch = git_ok(repo, "symbolic-ref", "--short", "-q", "HEAD") or "DETACHED HEAD"
-    ab = ahead_behind(repo)
-    if ab is None:
-        return f"{branch}, no upstream"
-    parts = [branch] + [YELLOW(f"ahead {ab[0]}")] * bool(ab[0]) + [YELLOW(f"behind {ab[1]}")] * bool(ab[1])
-    return ", ".join(parts)
 
 
 def header(text):
@@ -250,6 +128,254 @@ def confirm(question, yes):
         sys.exit(1)
 
 
+# ---- running git ---------------------------------------------------------------------
+class Res:
+    def __init__(self, rc, out_, err_):
+        self.rc, self.out, self.err = rc, out_, err_
+
+
+def _text(b):
+    return b.decode("utf-8", "replace").rstrip("\n")
+
+
+def git(cwd, *args, live=False, colour=False, internal=False):
+    """Run git in cwd -> Res(rc, out, err).
+    internal: for gitall's own queries (plain, uncoloured output, warnings kept apart);
+    live: attached to the terminal (editors, prompts)."""
+    if internal:
+        cmd = ["git", "-c", "core.quotePath=false", "-c", "color.ui=never"]
+    else:
+        cmd = ["git", "-c", "core.quotePath=false"]
+        if colour and TTY:
+            cmd += ["-c", "color.ui=always"]
+    cmd += ["--no-pager", *args]
+    if live:
+        return Res(subprocess.call(cmd, cwd=cwd), "", "")
+    p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE if internal else subprocess.STDOUT)
+    return Res(p.returncode, _text(p.stdout), _text(p.stderr or b""))
+
+
+def git_ok(cwd, *args):
+    r = git(cwd, *args, internal=True)
+    return r.out if r.rc == 0 else None
+
+
+def first_error(res):
+    lines = [ln.strip() for ln in (res.err + "\n" + res.out).splitlines() if ln.strip()]
+    for ln in lines:
+        if ln.startswith(("fatal:", "error:")):
+            return ln
+    return lines[0] if lines else f"git exited with {res.rc}"
+
+
+# ---- repos ---------------------------------------------------------------------------
+def natural(name):
+    return [int(s) if s.isdigit() else s.lower() for s in re.split(r"(\d+)", name)]
+
+
+def key(path):
+    return os.path.normcase(os.path.abspath(path))
+
+
+def is_repo(p):
+    return p.is_dir() and (p / ".git").exists()
+
+
+def git_dir(path):
+    g = path / ".git"
+    if g.is_dir():
+        return g
+    try:
+        text = g.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if text.startswith("gitdir:"):
+        d = Path(text[7:].strip())
+        return d if d.is_absolute() else path / d
+    return None
+
+
+def subdirs(d):
+    try:
+        return sorted((p for p in d.iterdir() if p.is_dir()), key=lambda p: natural(p.name))
+    except OSError:
+        return []
+
+
+OPS = (("MERGE_HEAD", "merge"), ("rebase-merge", "rebase"), ("rebase-apply", "rebase"),
+       ("CHERRY_PICK_HEAD", "cherry-pick"), ("REVERT_HEAD", "revert"))
+OP_HELP = {"merge": "merge in progress (fix conflicts and commit, or git merge --abort)",
+           "rebase": "rebase in progress (git rebase --continue or --abort)",
+           "cherry-pick": "cherry-pick in progress (git cherry-pick --continue or --abort)",
+           "revert": "revert in progress (git revert --continue or --abort)"}
+
+
+class State:
+    """A repo's branch, upstream, changes and in-progress operations, from one git status."""
+
+    def __init__(self, path, pathspec=()):
+        self.path = path
+        self.error = self.branch = self.oid = self.upstream = None
+        self.detached = self.unborn = self.gone = False
+        self.ahead = self.behind = self.stash = 0
+        self.staged = self.modified = self.untracked = self.conflicts = 0
+        self.files = []
+        self.gitdir = git_dir(path)
+        gd = self.gitdir
+        self.op = next((op for f, op in OPS if gd and (gd / f).exists()), None)
+        self.locked = bool(gd and (gd / "index.lock").exists())
+        res = git(path, "--no-optional-locks", "status", "--porcelain=v2", "--branch", "--show-stash",
+                  *(["--", *pathspec] if pathspec else []), internal=True)
+        if res.rc:
+            self.error = first_error(res)
+            return
+        for line in res.out.splitlines():
+            if line.startswith("# "):
+                name, _, val = line[2:].partition(" ")
+                if name == "branch.oid":
+                    self.unborn = val == "(initial)"
+                    self.oid = None if self.unborn else val
+                elif name == "branch.head":
+                    self.detached = val == "(detached)"
+                    self.branch = None if self.detached else val
+                elif name == "branch.upstream":
+                    self.upstream, self.gone = val, True   # until branch.ab shows it exists
+                elif name == "branch.ab":
+                    a, b = val.split()
+                    self.ahead, self.behind, self.gone = int(a), -int(b), False
+                elif name == "stash":
+                    self.stash = int(val)
+            elif line[:2] in ("1 ", "2 "):
+                xy = line[2:4]
+                path_ = line.split(" ", 9 if line[0] == "2" else 8)[-1]
+                if line[0] == "2":
+                    new, _, orig = path_.partition("\t")
+                    path_ = f"{orig} -> {new}"
+                self.staged += xy[0] != "."
+                self.modified += xy[1] != "."
+                self.files.append(f"{xy.replace('.', ' ')} {path_}")
+            elif line.startswith("u "):
+                self.conflicts += 1
+                self.files.append(f"{line[2:4]} {line.split(' ', 10)[-1]}")
+            elif line.startswith("? "):
+                self.untracked += 1
+                self.files.append(f"?? {line[2:]}")
+
+    @property
+    def dirty(self):
+        return bool(self.staged or self.modified or self.untracked or self.conflicts)
+
+    @property
+    def tracking(self):
+        """Has an upstream branch that exists (as of the last fetch)."""
+        return bool(self.upstream) and not self.gone
+
+    def problem(self):
+        """Why it isn't safe to commit/pull/push here right now, or None."""
+        if self.error:
+            return self.error
+        if self.locked:
+            return (f"index.lock exists (another git or editor running? if not, delete "
+                    f"{self.gitdir / 'index.lock'})")
+        if self.op:
+            return OP_HELP[self.op]
+        if self.detached:
+            return "detached HEAD (git switch <branch>)"
+        return None
+
+
+class Repo:
+    def __init__(self, path, root):
+        self.path, self.folder = path, path.name
+        try:
+            self.name = path.relative_to(root).as_posix()
+        except ValueError:
+            self.name = path.name
+        self._state = None
+
+    @property
+    def state(self):
+        if self._state is None:
+            self._state = State(self.path)
+        return self._state
+
+    def refresh(self):
+        self._state = None
+
+    def __repr__(self):
+        return f"<Repo {self.name}>"
+
+
+# ---- which repos ---------------------------------------------------------------------
+class Workspace:
+    def __init__(self, root, config=None):
+        self.root, self.config = root, config
+        self.repos, self.groups = [], {}
+
+
+def find_workspace(start):
+    """Where the repos are, like git finds its repo from any subfolder:
+    1. the repos listed in the nearest .gitall file (start or a parent folder);
+    2. else the git repos directly inside start;
+    3. else, if start is inside a repo, that repo and its sibling repos."""
+    for d in [start, *start.parents]:
+        if (d / CONFIG).is_file():
+            return read_config(d, d / CONFIG)
+    ws = Workspace(start)
+    found = [p for p in subdirs(start) if is_repo(p)]
+    if not found:
+        top = git_ok(start, "rev-parse", "--show-toplevel")
+        if top:
+            ws.root = Path(top).resolve().parent
+            found = [p for p in subdirs(ws.root) if is_repo(p)]
+    ws.repos = [Repo(p, ws.root) for p in found]
+    return ws
+
+
+def read_config(root, cfg):
+    ws = Workspace(root, cfg)
+    known = {}
+    for n, raw in enumerate(cfg.read_text(encoding="utf-8").splitlines(), 1):
+        entry = raw.split("#", 1)[0].strip().rstrip("/\\")
+        if not entry:
+            continue
+        if any(ch in entry for ch in "*?["):
+            hits = [p for p in subdirs(root) if fnmatch.fnmatchcase(p.name, entry) and is_repo(p)]
+        else:
+            hits = [root / entry] if is_repo(root / entry) else []
+        if not hits:
+            die(f"{cfg}, line {n}: '{entry}' is not a git repo")
+        for p in hits:
+            if key(p) not in known:
+                known[key(p)] = Repo(p, root)
+                ws.repos.append(known[key(p)])
+    return ws
+
+
+def no_match(ws, term):
+    listing = ", ".join(f"{i}:{r.name}" for i, r in enumerate(ws.repos, 1))
+    groups = f"; groups: {', '.join(name for name, _ in ws.groups.values())}" if ws.groups else ""
+    die(f"no repo matches '{term}' (repos: {listing}{groups})")
+
+
+def select(ws, picks):
+    """The repos chosen by -r, in list order."""
+    if not picks:
+        return ws.repos
+    chosen = set()
+    for term in picks:
+        if term.isdigit():
+            hits = ws.repos[int(term) - 1:int(term)] if 1 <= int(term) <= len(ws.repos) else []
+        else:
+            hits = [r for r in ws.repos if term.lower() in r.name.lower()]
+        if not hits:
+            no_match(ws, term)
+        chosen.update(hits)
+    return [r for r in ws.repos if r in chosen]
+
+
+# ---- what a command does -------------------------------------------------------------
 def read_only(cmd, args):
     """True if git <cmd> <args> only shows things (no confirmation needed)."""
     if cmd in READ_ONLY:
@@ -363,191 +489,227 @@ def commit_opens_editor(args):
 
 
 # ---- commands --------------------------------------------------------------------------
+def branch_info(s):
+    branch = s.branch or "DETACHED HEAD"
+    if not s.tracking:
+        return f"{branch}, no upstream"
+    return ", ".join([branch] + [YELLOW(f"ahead {s.ahead}")] * bool(s.ahead) +
+                     [YELLOW(f"behind {s.behind}")] * bool(s.behind))
+
+
 class Run:
-    def __init__(self, repos, yes):
-        self.repos, self.yes = repos, yes
+    def __init__(self, ws, repos, o):
+        self.ws, self.repos, self.o = ws, repos, o
         self.failed, self.skipped = [], []
+        self.width = max((len(r.name) for r in repos), default=0)
+
+    # -- bookkeeping
+    def skip(self, repo, why):
+        self.skipped.append((repo, why))
+
+    def fail(self, repo, msg):
+        self.failed.append((repo, msg))
 
     def finish(self):
         for title, items, col in (("Skipped:", self.skipped, YELLOW), ("Failed:", self.failed, RED)):
             if items:
                 out()
                 out(col(title))
-                for s in items:
-                    out(f"  {s}")
+                for r, msg in items:
+                    out(f"  {r.name}: {msg}")
         sys.exit(1 if self.failed else 0)
 
+    def plan(self):
+        """The repos that are safe to change; skips the others."""
+        res = []
+        for r in self.repos:
+            prob = r.state.problem()
+            if prob:
+                self.skip(r, prob)
+            else:
+                res.append(r)
+        return res
+
+    # -- status
     def status(self, args):
         if any(a.startswith("-") and a != "--" for a in args):
             return self.passthrough("status", args)
+        paths = [a for a in args if a != "--"]
         clean = []
         for r in self.repos:
-            rc, text = git(r, "status", "--porcelain=v1", *args, stderr=False)
-            if rc != 0:
+            s = State(r.path, paths) if paths else r.state
+            if s.error:
                 header(r.name)
-                out(git(r, "status", *args)[1])
-                self.failed.append(f"{r.name}: git status failed")
+                out(git(r.path, "status", *args).out)
+                self.fail(r, "git status failed")
                 continue
-            info, prob = branch_info(r), problem(r)
-            if not text and not prob and "ahead" not in info and "behind" not in info:
+            info, prob = branch_info(s), s.problem()
+            if not s.files and not prob and not (s.tracking and (s.ahead or s.behind)):
                 clean.append(r.name)
                 continue
             header(f"{r.name} ({info})")
             if prob:
                 out(RED(f"   ! {prob}"))
-            out(text or "   (no changes)")
+            out("\n".join(s.files) or "   (no changes)")
         if clean:
             out()
             out(f"{GREEN('clean:')} {' '.join(clean)}")
         self.finish()
 
+    # -- commit
     def commit(self, args):
         user_dry = "--dry-run" in args
         editor = commit_opens_editor(args)
-        plan = []
-        for r in self.repos:
-            prob = problem(r)
-            if prob:
-                self.skipped.append(f"{r.name}: {prob}")
-                continue
-            rargs = [a.replace("{repo}", r.name) for a in args]
+        todo = []
+        for r in self.plan():
+            rargs = [a.replace("{repo}", r.folder) for a in args]
             dry = ["commit", "--dry-run", "--short", *[a for a in rargs if a != "--dry-run"]]
-            rc, text = git(r, *dry, stderr=False)
-            if rc != 0:  # nothing to commit here -- unless git reported a real error
-                text = git(r, *dry)[1]
-                if re.search(r"^(fatal|error):", text, re.M) and "did not match any file(s) known to git" not in text:
+            res = git(r.path, *dry, internal=True)
+            if res.rc != 0:  # nothing to commit here -- unless git reported a real error
+                if re.search(r"^(fatal|error):", res.err, re.M) and \
+                        "did not match any file(s) known to git" not in res.err:
                     header(r.name)
-                    out(text)
-                    self.failed.append(f"{r.name}: git commit failed")
+                    out(res.err)
+                    self.fail(r, "git commit failed")
                 continue
-            plan.append((r, rargs))
-            header(f"{r.name} ({branch_info(r)})")
-            out("\n".join(ln for ln in text.splitlines() if ln[:1] not in (" ", "?")))
-        if not plan:
+            todo.append((r, rargs))
+            header(f"{r.name} ({branch_info(r.state)})")
+            out("\n".join(ln for ln in res.out.splitlines() if ln[:1] not in (" ", "?")))
+        if not todo:
             out("nothing to commit (stage changes with  git add  first, or use  commit -a  or  commit -- <paths>)")
             self.finish()
         out()
         if user_dry:
-            out(f"(dry run: {len(plan)} repo(s) would be committed)")
+            out(f"(dry run: {len(todo)} repo(s) would be committed)")
             self.finish()
         if editor:
             out(YELLOW("git will open an editor for the message in each repo."))
-        confirm(f"Commit {len(plan)} repo(s)?", self.yes)
-        for r, rargs in plan:
-            rc, text = git(r, "commit", *rargs, live=True) if editor else git(r, "commit", "-q", *rargs)
-            if rc == 0:
-                n = len((git_ok(r, "show", "--name-only", "--format=", "HEAD") or "").splitlines())
-                out(f"{r.name}: {GREEN('committed')} {git_ok(r, 'log', '-1', '--format=%h %s')} ({n} file(s))")
+        confirm(f"Commit {len(todo)} repo(s)?", self.o.yes)
+        for r, rargs in todo:
+            res = git(r.path, "commit", *rargs, live=True) if editor else git(r.path, "commit", "-q", *rargs)
+            if res.rc == 0:
+                n = len((git_ok(r.path, "show", "--name-only", "--format=", "HEAD") or "").splitlines())
+                out(f"{r.name}: {GREEN('committed')} {git_ok(r.path, 'log', '-1', '--format=%h %s')} "
+                    f"({n} file(s))")
             else:
                 out(f"{r.name}: {RED('commit failed')}")
-                if text:
-                    out(indent(text))
-                self.failed.append(f"{r.name}: commit failed")
+                if res.out:
+                    out(indent(res.out))
+                self.fail(r, "commit failed")
         self.finish()
 
+    # -- push
     def push(self, args):
         user_dry = "--dry-run" in args or "-n" in args
         plain = not [a for a in args if a not in ("--dry-run", "-n")]  # no remote/refspec/flags given
-        plan = []
-        for r in self.repos:
-            prob = problem(r)
-            if prob:
-                self.skipped.append(f"{r.name}: {prob}")
-                continue
+        todo = []
+        for r in self.plan():
+            s = r.state
             if plain:
-                ab = ahead_behind(r)
-                if ab is None:
-                    self.skipped.append(f"{r.name}: no upstream branch (git push -u origin <branch>)")
+                if not s.tracking:
+                    self.skip(r, "no upstream branch (git push -u origin <branch>)")
                     continue
-                if ab[0] == 0:
+                if not s.ahead:
                     continue
-                header(f"{r.name} ({branch_info(r)})")
-                out(git_ok(r, "log", "--format=  %h %s", "@{u}..HEAD") or "")
-            plan.append(r)
-        if not plan:
+                header(f"{r.name} ({branch_info(s)})")
+                out(git_ok(r.path, "log", "--format=  %h %s", "@{u}..HEAD") or "")
+            todo.append(r)
+        if not todo:
             out("nothing to push")
             self.finish()
         if not user_dry:
             out()
-            confirm(f"Push {len(plan)} repo(s)?", self.yes)
-        for r in plan:
-            rc, text = git(r, "push", *args)
-            if rc == 0:
-                out(f"{r.name}: {text}" if user_dry else f"{r.name}: {GREEN('pushed')}")
-            elif re.search(r"rejected|fetch first|non-fast-forward", text):
+            confirm(f"Push {len(todo)} repo(s)?", self.o.yes)
+        for r in todo:
+            res = git(r.path, "push", *args)
+            if res.rc == 0:
+                out(f"{r.name}: {res.out}" if user_dry else f"{r.name}: {GREEN('pushed')}")
+            elif re.search(r"rejected|fetch first|non-fast-forward", res.out):
                 out(f"{r.name}: {RED('rejected')}")
-                self.failed.append(f"{r.name}: the remote has newer commits -> "
-                                   f"{PROG} -r {r.name} pull, then push again")
+                self.fail(r, f"the remote has newer commits -> {PROG} -r {r.name} pull, then push again")
             else:
                 out(f"{r.name}: {RED('push failed')}")
-                out(indent(text))
-                self.failed.append(f"{r.name}: push failed")
+                out(indent(res.out))
+                self.fail(r, "push failed")
         self.finish()
 
+    # -- pull
     def pull(self, args):
         live = interactive("pull", args)
         uptodate = []
-        for r in self.repos:
-            prob = problem(r)
-            if prob:
-                self.skipped.append(f"{r.name}: {prob}")
-                continue
-            before = git_ok(r, "rev-parse", "-q", "HEAD")
+        for r in self.plan():
+            before = r.state.oid
             if live:
                 header(r.name)
-            rc, text = git(r, "pull", "--no-edit", *args, live=live)
-            if rc == 0 and git_ok(r, "rev-parse", "-q", "HEAD") == before:
+            res = git(r.path, "pull", "--no-edit", *args, live=live)
+            r.refresh()
+            if res.rc == 0 and r.state.oid == before:
                 uptodate.append(r.name)
                 continue
             if not live:
                 header(r.name)
-                out(text)
-            if rc != 0:
-                if git_path(r, "MERGE_HEAD").exists():
-                    self.failed.append(f"{r.name}: CONFLICT -- fix the files listed above, then "
-                                       f"git add <files> and git commit --no-edit")
+                out(res.out)
+            if res.rc != 0:
+                if r.state.op == "merge":
+                    self.fail(r, "CONFLICT -- fix the files listed above, then git add <files> and "
+                                 "git commit --no-edit")
                 else:
-                    self.failed.append(f"{r.name}: pull failed (if local changes block it, commit them first)")
+                    self.fail(r, "pull failed (if local changes block it, commit them first)")
         if uptodate:
             out()
             out(f"{GREEN('up to date:')} {' '.join(uptodate)}")
         self.finish()
 
+    # -- fetch
     def fetch(self, args):
-        width = max(len(r.name) for r in self.repos) + 2
+        width = self.width + 2
         for r in self.repos:
-            rc, text = git(r, "fetch", *args)
-            if rc == 0:
-                out(f"{r.name:{width}}{branch_info(r)}")
+            res = git(r.path, "fetch", *args)
+            r.refresh()
+            if res.rc == 0:
+                out(f"{r.name:{width}}{branch_info(r.state)}")
             else:
                 out(f"{r.name}: {RED('fetch failed')}")
-                out(indent(text))
-                self.failed.append(f"{r.name}: fetch failed")
+                out(indent(res.out))
+                self.fail(r, "fetch failed")
         self.finish()
 
+    # -- everything else
     def passthrough(self, cmd, args):
         live, shows = interactive(cmd, args), read_only(cmd, args)
         if not (shows or cmd in NO_CONFIRM):
             out(f"Will run:  git {' '.join([cmd, *args])}")
             out(f"in: {' '.join(r.name for r in self.repos)}")
-            confirm("Continue?", self.yes)
+            confirm("Continue?", self.o.yes)
         printed = False
         for r in self.repos:
             if live:
                 header(r.name)
-                rc, _ = git(r, cmd, *args, live=True)
+                res = git(r.path, cmd, *args, live=True)
             else:
-                rc, text = git(r, cmd, *args, colour=True)
-                if text:
+                res = git(r.path, cmd, *args, colour=True)
+                if res.out:
                     header(r.name)
-                    out(text)
+                    out(res.out)
                     printed = True
             # exit 1 from grep / diff --exit-code means "no match" / "has differences", not failure
-            if rc and not (rc == 1 and (cmd == "grep" or (cmd == "diff" and {"--exit-code", "--quiet"} & set(args)))):
-                self.failed.append(f"{r.name}: git {cmd} exited with {rc}")
+            if res.rc and not (res.rc == 1 and (cmd == "grep" or (cmd == "diff" and {"--exit-code", "--quiet"} & set(args)))):
+                self.fail(r, f"git {cmd} exited with {res.rc}")
         if not printed and not live:
             out("(no output)" if shows else f"done in {len(self.repos)} repo(s)")
         self.finish()
+
+
+def list_repos(ws):
+    out(f"{len(ws.repos)} repo(s) in {ws.root}" + (f" (from {CONFIG})" if ws.config else ""))
+    for n, r in enumerate(ws.repos, 1):
+        out(f"{n:3}  {r.name}")
+    return 0
+
+
+class Options:
+    def __init__(self):
+        self.picks, self.yes, self.start = [], False, Path.cwd()
 
 
 def usage():
@@ -555,32 +717,26 @@ def usage():
 
 
 def main(argv):
-    filters, yes, start = [], False, Path.cwd()
-    i = 0
+    o, i = Options(), 0
     while i < len(argv):
         a = argv[i]
         if a in ("-r", "--repo", "-C"):
             if i + 1 >= len(argv):
                 die(f"{a} needs a value")
             if a == "-C":
-                start = (start / argv[i + 1]).resolve()
-                if not start.is_dir():
-                    die(f"-C: no such directory: {start}")
+                o.start = (o.start / argv[i + 1]).resolve()
+                if not o.start.is_dir():
+                    die(f"-C: no such directory: {o.start}")
             else:
-                filters.append(argv[i + 1])
+                o.picks.append(argv[i + 1])
             i += 2
             continue
         if a.startswith("--repo="):
-            filters.append(a.split("=", 1)[1])
+            o.picks.append(a.split("=", 1)[1])
         elif a in ("-y", "--yes"):
-            yes = True
+            o.yes = True
         elif a in ("-l", "--list"):
-            root, repos = find_repos(start)
-            cfg = root / CONFIG
-            out(f"{len(repos)} repo(s) in {root}" + (f" (from {CONFIG})" if cfg.is_file() else ""))
-            for n, r in enumerate(repos, 1):
-                out(f"{n:3}  {r.name}")
-            return 0
+            return list_repos(find_workspace(o.start))
         elif a in ("-h", "--help"):
             out(usage())
             return 0
@@ -600,17 +756,19 @@ def main(argv):
         return subprocess.call(["git", cmd, *args])  # once, not once per repo
     if cmd in ("commit", "push", "pull") or cmd not in NO_CONFIRM:
         if "-y" in args or "--yes" in args:
-            yes = True
+            o.yes = True
             args = [a for a in args if a not in ("-y", "--yes")]
 
-    run = Run(select_repos(start, filters), yes)
+    ws = find_workspace(o.start)
+    if not ws.repos:
+        die(f"no git repos found in {ws.root} (run it in or inside the folder that contains "
+            f"your repos, or list them in a {CONFIG} file)")
+    run = Run(ws, select(ws, o.picks), o)
     handler = {"status": run.status, "commit": run.commit, "push": run.push,
                "pull": run.pull, "fetch": run.fetch}.get(cmd)
     if handler:
-        handler(args)
-    else:
-        run.passthrough(cmd, args)
-    return 0
+        return handler(args)
+    return run.passthrough(cmd, args)
 
 
 if __name__ == "__main__":
