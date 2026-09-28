@@ -5,6 +5,14 @@ from conftest import git, write
 from gitall import read_only
 
 
+def test_push_with_arguments_does_not_crash(world, run):
+    world.repo("A")
+    world.local_commit("A", {"x.tex": "x"})
+    r = run("push", "origin", "HEAD", "-y", cwd=world.work)
+    assert r.code == 0, r
+    assert world.remote_head("A") == world.head("A")
+
+
 def test_broken_repo_is_a_failure_not_a_skip(world, run):
     world.repo("A")
     broken = world.work / "B"

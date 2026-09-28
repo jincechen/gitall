@@ -53,10 +53,11 @@ Put these **before** the git command.
 - **commit**: previews each repo's commit and asks once. Repos with nothing to commit are skipped.
   `{repo}` in the message is replaced by the folder name. `--dry-run` only shows the preview.
   Without `-m` (or with `-c`, `-e`, `--squash`), git opens an editor for each repo in turn.
-- **push**: only repos with unpushed commits, after a confirmation. If the remote has newer
-  commits, it tells you to `pull` first.
-- **pull**: up-to-date repos are listed on one line; conflicts are reported, not resolved.
-- **fetch**: shows ahead/behind for each repo afterwards.
+- **push**: only repos with unpushed commits, after a preview and one confirmation. If the
+  remote has newer commits, it tells you to pull first. Force pushes are flagged.
+- **pull**: one line per repo (fast-forward / merged / rebased); up-to-date repos on one line;
+  repos without an upstream are skipped; conflicts are reported, not resolved.
+- **fetch**: one line per repo with what came in, and ahead/behind.
 - **Anything else** runs in every repo. If each repo prints one line, you get one aligned
   line per repo; otherwise each repo's output under its name; repos with no output are left
   out. Commands that change things show what will run and ask first.
