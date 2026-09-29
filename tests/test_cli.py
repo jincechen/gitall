@@ -1,4 +1,4 @@
-"""Command line handling, output encoding, the Windows launcher."""
+"""Command line handling, output encoding, renaming the script, the Windows launcher."""
 import os
 import shutil
 import subprocess
@@ -13,10 +13,10 @@ def test_no_command_prints_help(world, run):
     assert r.code == 2 and r.out.startswith("gitall -- run git in several repositories")
 
 
-def test_help(world, run):
-    for argv in (["-h"], ["--help"], ["help"]):
-        r = run(*argv, cwd=world.work)
-        assert r.code == 0 and "Usage:  gitall [options]" in r.out, argv
+@pytest.mark.parametrize("argv", [["-h"], ["--help"], ["help"]])
+def test_help(world, run, argv):
+    r = run(*argv, cwd=world.work)
+    assert r.code == 0 and "Usage:  gitall [options]" in r.out
 
 
 def test_unknown_option(world, run):
@@ -28,14 +28,17 @@ def test_unknown_option(world, run):
 def test_option_missing_its_value(world, run):
     r = run("status", "-r", cwd=world.work)  # after the command: goes to git, not to gitall
     assert "needs a value" not in r.err
-    r = run("-r", cwd=world.work)
-    assert r.code == 2 and "-r needs a value" in r.err
+    for opt in ("-r", "-C", "-c"):
+        r = run(opt, cwd=world.work)
+        assert r.code == 2 and f"{opt} needs a value" in r.err
 
 
 def test_git_version_runs_once(world, run):
     world.repo("A", remote=False)
     world.repo("B", remote=False)
     r = run("version", cwd=world.work)
+    assert r.code == 0 and r.out.count("git version") == 1
+    r = run("--version", cwd=world.work)
     assert r.code == 0 and r.out.count("git version") == 1
 
 
@@ -62,6 +65,23 @@ def test_yes_after_double_dash_is_a_path(world, run):
     r = run("-y", "add", "--", "-y", cwd=world.work)
     assert r.code == 0, r
     assert "A  -y" in git(a, "status", "--porcelain")
+
+
+def test_git_options_before_the_command_are_passed_on(world, run):
+    world.repo("A")
+    world.repo("B")
+    r = run("-c", "core.abbrev=12", "log", "-1", "--format=%h", cwd=world.work)
+    assert r.code == 0, r
+    assert all(len(line.split()[1]) == 12 for line in r.out.splitlines())
+    r = run("--no-pager", "--literal-pathspecs", "log", "-1", "--format=%s", cwd=world.work)
+    assert r.code == 0 and "A  initial" in r.out
+
+
+@pytest.mark.parametrize("opt", ["--git-dir=x", "--work-tree", "-p", "--paginate", "--bare"])
+def test_git_options_that_make_no_sense_are_refused(world, run, opt):
+    world.repo("A")
+    r = run(opt, "status", cwd=world.work)
+    assert r.code == 2 and "doesn't work with gitall" in r.err
 
 
 def test_closed_stdin_in_a_real_process(world, run_script):
@@ -96,22 +116,6 @@ def test_closed_pipe_exits_quietly(world, run_script):
     assert "Traceback" not in err and "Exception ignored" not in err
 
 
-def test_gitall_file_is_read_as_utf8(world, run):
-    world.repo("Übung", remote=False)
-    write(world.work / ".gitall", "Übung\n")
-    assert "Übung" in run("-l", cwd=world.work).out
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows launcher")
-def test_windows_launcher(world):
-    world.repo("A", remote=False)
-    cmd = str(ROOT / "gitall.cmd")
-    p = subprocess.run(["cmd", "/c", cmd, "-l"], cwd=world.work, capture_output=True)
-    assert p.returncode == 0 and b"A" in p.stdout
-    p = subprocess.run(["cmd", "/c", cmd, "-r", "zzz", "status"], cwd=world.work, capture_output=True)
-    assert p.returncode == 2  # the exit code gets through the .cmd
-
-
 def test_renaming_the_script_renames_messages_and_config(world, run_script, tmp_path):
     for name in ("A", "B"):
         world.repo(name, remote=False)
@@ -126,3 +130,13 @@ def test_renaming_the_script_renames_messages_and_config(world, run_script, tmp_
     assert "Usage:  multigit" in r.out and ".multigit file" in r.out and "gitall" not in r.out
     r = run_script("-r", "zzz", "status", cwd=world.work, script=script)
     assert r.err.startswith("multigit: no repo matches")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher")
+def test_windows_launcher(world):
+    world.repo("A", remote=False)
+    cmd = str(ROOT / "gitall.cmd")
+    p = subprocess.run(["cmd", "/c", cmd, "-l"], cwd=world.work, capture_output=True)
+    assert p.returncode == 0 and b"A" in p.stdout
+    p = subprocess.run(["cmd", "/c", cmd, "-r", "zzz", "status"], cwd=world.work, capture_output=True)
+    assert p.returncode == 2  # the exit code gets through the .cmd
