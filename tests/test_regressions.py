@@ -40,3 +40,9 @@ def test_retry_line_keeps_dash_C(world, run):
                                        ("bisect", ["log"])])
 def test_more_read_only_forms(cmd, args):
     assert read_only(cmd, args)
+
+
+def test_quiet_status_says_when_all_is_clean(world, run):
+    world.repo("A")
+    world.repo("B")
+    assert run("-q", "status", cwd=world.work).out.strip() == "all 2 repos clean"

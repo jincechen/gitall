@@ -237,6 +237,15 @@ def test_pull_skips_unsafe_repo(world, run):
     r = run("pull", cwd=world.work)
     assert "Skipped:\n  A: index.lock exists" in r.out
     assert world.head("A") == before
+def test_quiet_pull_leaves_out_up_to_date_repos(world, run):
+    world.repo("A")
+    world.repo("B")
+    world.coauthor_edit("B", {"main.tex": "edited\n"})
+    r = run("-q", "pull", cwd=world.work)
+    assert "B  fast-forward" in r.out
+    assert "up to date" not in r.out and "pull:" not in r.out
+
+
 # ---- fetch -------------------------------------------------------------------------------
 def test_fetch_shows_ahead_and_behind(world, run):
     world.repo("A")
