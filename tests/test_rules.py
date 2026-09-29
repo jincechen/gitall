@@ -1,7 +1,9 @@
 """The tables behind confirmation, interactive runs, the commit editor and argument handling."""
+import os
+
 import pytest
 
-from gitall import commit_opens_editor, interactive, read_only, strip_yes
+from gitall import absolutize, commit_opens_editor, interactive, read_only, strip_yes
 
 
 @pytest.mark.parametrize("cmd, args, expected", [
@@ -176,3 +178,24 @@ def test_commit_opens_editor(args, expected):
 ])
 def test_strip_yes(args, expected):
     assert strip_yes(args) == expected
+
+
+def test_absolutize_makes_file_options_relative_to_the_start():
+    start = os.path.abspath("start")
+    here = os.path.join(start, "msg.txt")
+    assert absolutize("commit", ["-F", "msg.txt"], start) == ["-F", here]
+    assert absolutize("commit", ["-Fmsg.txt"], start) == ["-F" + here]
+    assert absolutize("commit", ["--file=msg.txt"], start) == ["--file=" + here]
+    assert absolutize("commit", ["-F", "-"], start) == ["-F", "-"]              # stdin
+    assert absolutize("archive", ["-o", "out.zip", "HEAD"], start) == ["-o", os.path.join(start, "out.zip"), "HEAD"]
+    assert absolutize("log", ["--pathspec-from-file", "list"], start) == ["--pathspec-from-file",
+                                                                          os.path.join(start, "list")]
+
+
+def test_absolutize_leaves_everything_else_alone():
+    start = os.path.abspath("start")
+    for cmd, args in [("commit", ["-m", "-Fx is a message"]), ("commit", ["-m", "-t foo"]),
+                      ("commit", ["-am", "x"]), ("commit", ["-m", "x", "--", "-F"]),
+                      ("log", ["-o", "x"]), ("branch", ["-t", "origin/x"]),
+                      ("commit", ["-F", os.path.join(start, "abs.txt")])]:
+        assert absolutize(cmd, args, start) == args, (cmd, args)

@@ -63,10 +63,14 @@ Put these **before** the git command.
 - **Anything else** runs in every repo. If each repo prints one line, you get one aligned
   line per repo; otherwise each repo's output under its name; repos with no output are left
   out. Commands that change things show what will run and ask first.
+- `help`, `version`, `clone <url>`, `init <dir>` and `config --global` run once, not once per repo.
+- Relative files in options (`commit -F msg.txt`, `archive -o out.zip`) mean the file where
+  you are, not one inside each repo.
 - A repo in the middle of a merge or rebase, on a detached HEAD, or with a leftover
   `index.lock` is skipped for commit/push/pull, with the reason shown.
 - One repo failing doesn't stop the others. At the end, failures are listed (identical errors
   together) with a `retry:` command line for just those repos; the exit code is 1.
+  `grep` and `diff --quiet` exit like git: by whether anything matched or differed.
 
 ## Examples
 

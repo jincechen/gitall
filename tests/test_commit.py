@@ -174,10 +174,19 @@ def test_options_that_give_the_message_dont_open_an_editor(world, run, opts):
     write(world.work / "msg.txt", "From file\n")
     write(a / "main.tex", "changed\n")
     git(a, "add", "-A")
-    r = run("commit", *[o if o != "msg.txt" else str(world.work / "msg.txt") for o in opts], "-y",
-            cwd=world.work)
+    r = run("commit", *opts, "-y", cwd=world.work)
     assert r.code == 0, r  # GIT_EDITOR=false would have failed the commit
     assert "editor" not in r.out
+
+
+def test_relative_message_file_is_read_from_the_starting_folder(world, run):
+    a, b = world.repo("A"), world.repo("B")
+    write(world.work / "msg.txt", "From the file\n")
+    for repo in (a, b):
+        write(repo / "main.tex", "changed\n")
+    r = run("commit", "-a", "-F", "msg.txt", "-y", cwd=world.work)
+    assert r.code == 0, r
+    assert last_message(a) == last_message(b) == "From the file"
 
 
 # ---- commits that don't need changes -----------------------------------------------------
@@ -204,6 +213,14 @@ def test_commit_patch_runs_attached_and_only_where_there_are_changes(world, run_
     assert "git will open an editor (or ask questions) in each repo in turn." in r.out
     assert "== A" in r.out and "== B" not in r.out
     assert last_message(a) == "initial"  # nothing was picked, so nothing committed
+
+
+def test_commit_help_is_shown_once(world, run):
+    world.repo("A")
+    world.repo("B")
+    r = run("commit", "-h", cwd=world.work)
+    assert r.code == 129
+    assert r.all.count("usage: git commit") == 1
 
 
 def test_non_ascii_filenames_in_preview(world, run):

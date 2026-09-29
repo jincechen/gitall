@@ -2,7 +2,28 @@
 import pytest
 
 from conftest import git, write
-from gitall import read_only
+from gitall import absolutize, read_only
+
+
+@pytest.mark.parametrize("args", [["-am", "-Fix typo"], ["-am", "-tidy up"], ["-m", "-Fix"],
+                                  ["--message", "-Fix"], ["-e", "-m", "-Fix"]])
+def test_absolutize_leaves_messages_alone(args, tmp_path):
+    assert absolutize("commit", args, tmp_path) == args
+
+
+def test_absolutize_still_fixes_files_after_flags(tmp_path):
+    out = absolutize("commit", ["-e", "-F", "msg.txt"], tmp_path)
+    assert out[:2] == ["-e", "-F"] and out[2] == str(tmp_path / "msg.txt")
+    out = absolutize("commit", ["-aFmsg.txt"], tmp_path)
+    assert out == [f"-aF{tmp_path / 'msg.txt'}"]
+
+
+def test_commit_message_starting_with_dash_f(world, run):
+    a = world.repo("A")
+    write(a / "main.tex", "changed\n")
+    r = run("commit", "-am", "-Fix typo", "-y", cwd=world.work)
+    assert r.code == 0, r
+    assert git(a, "log", "-1", "--format=%s") == "-Fix typo"
 
 
 def test_push_with_arguments_does_not_crash(world, run):
