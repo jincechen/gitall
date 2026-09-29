@@ -37,6 +37,12 @@ def test_repos_without_output_are_left_out(world, run):
     assert r.out.strip() == "B  Unpushed"
 
 
+def test_quiet_leaves_out_the_no_output_note(world, run):
+    world.repo("A")
+    r = run("-q", "diff", cwd=world.work)
+    assert r.code == 0 and r.out == ""
+
+
 def test_git_messages_go_to_stderr(world, run):
     world.repo("A")
     world.repo("B")
@@ -144,6 +150,28 @@ def test_stash_show_patch_does_not_ask(world, run):
     git(a, "stash", "-q")
     r = run("stash", "show", "-p", cwd=world.work, tty=False)
     assert r.code == 0 and headers(r) == ["A"] and "+stashed" in r.out
+
+
+def test_prefix_puts_the_repo_path_in_front_of_each_line(world, run):
+    world.repo("A", {"main.tex": "x\n", "sub/b.tex": "y\n"})
+    world.repo("B")
+    r = run("--prefix", "ls-files", cwd=world.work)
+    assert r.code == 0
+    assert r.out.splitlines() == ["A/main.tex", "A/sub/b.tex", "B/main.tex"]
+
+
+def test_prefix_is_relative_to_where_you_are(world, run):
+    world.repo("A")
+    world.repo("B")
+    r = run("--prefix", "ls-files", cwd=world.work / "A")
+    assert r.out.splitlines() == ["main.tex", "../B/main.tex"]
+
+
+def test_prefix_with_grep(world, run):
+    world.repo("A", {"main.tex": "TODO here\n"})
+    world.repo("B")
+    r = run("--prefix", "grep", "-n", "TODO", cwd=world.work)
+    assert r.out.strip() == "A/main.tex:1:TODO here"
 
 
 def test_non_ascii_filenames_are_not_quoted(world, run):

@@ -106,6 +106,15 @@ def test_eleven_files_are_all_listed(world, run):
     assert "more" not in r.out
 
 
+def test_quiet_hides_repos_with_nothing_to_report(world, run):
+    world.repo("A")
+    b = world.repo("B")
+    write(b / "main.tex", "changed\n")
+    r = run("-q", "status", cwd=world.work)
+    assert "A" not in r.out.split()
+    assert "B  main  1 modified" in r.out
+
+
 def test_stale_fetch_note(world, run):
     a = world.repo("A")
     world.repo("B")

@@ -24,6 +24,8 @@ Options (before the git command):
   -l, --list        list the repos (with their numbers) and exit
   -C DIR            start in DIR instead of the current directory
   -y, --yes         don't ask for confirmation (also accepted after the git command)
+  -q, --quiet       leave out repos with nothing to report
+  --prefix          start each output line with the repo's path (grep, ls-files, ...)
   -h, --help        show this help
 
 Which repos: the folders listed in a .gitall file (in the current directory or the
@@ -535,14 +537,23 @@ class Blocks:
     """Each repo's output under a header. While every repo prints just one line, the lines
     are held back and printed as aligned 'repo  line' rows instead."""
 
-    def __init__(self):
+    def __init__(self, prefix_from=None):
         self.pending, self.streaming, self.printed = [], False, False
+        self.prefix_from = prefix_from
 
     def add(self, repo, res):
         o, e = res.out.splitlines() if res.out else [], res.err.splitlines() if res.err else []
         if not o and not e:
             return
         self.printed = True
+        if self.prefix_from is not None:
+            pre = os.path.relpath(repo.path, self.prefix_from).replace(os.sep, "/")
+            pre = "" if pre == "." else pre + "/"
+            for ln in o:
+                out(pre + ln)
+            for ln in e:
+                err(f"{repo.name}: {ln}")
+            return
         if not self.streaming and (len(o) == 1 or (not o and len(e) == 1)):
             # one line of output (git's warnings on stderr don't count): a row
             self.pending += [(repo, True, ln) for ln in o] + [(repo, False, ln) for ln in e]
@@ -646,7 +657,7 @@ class Run:
                     by_retry.setdefault(tuple(retry or self.gitcmd), []).append(r)
             for argv, rs in by_retry.items():
                 out(f"  retry:  {self.command_line(rs, argv)}")
-        if label and len(self.repos) > 1:
+        if label and len(self.repos) > 1 and not self.o.quiet:
             parts = [f"{len(v)} {k}" for k, v in self.tally.items() if v]
             parts += [f"{len(self.failed)} failed"] * bool(self.failed)
             parts += [f"{len(self.skipped)} skipped"] * bool(self.skipped)
@@ -686,9 +697,15 @@ class Run:
             s = r.state
             if s.error:
                 self.fail(r, s.error)
+            busy = s.dirty or not s.tracking or s.ahead or s.behind or s.op or s.locked or s.detached
+            if self.o.quiet and not busy:
+                continue
             out(repo_row(r, self.width, bwidth))
             if s.files:
                 details.append(r)
+        if self.o.quiet and not details and not self.failed and \
+                not any(r.state.ahead or r.state.behind or not r.state.tracking for r in self.repos):
+            out(f"all {plural(len(self.repos), 'repo')} clean")
         for r in details:
             header(r.name)
             files = r.state.files
@@ -861,7 +878,7 @@ class Run:
                     self.fail(r, f"CONFLICT in {files}: fix them, then git add <files> and {nxt}", False)
                 else:
                     self.fail(r, first_error(res))
-        if uptodate:
+        if uptodate and not self.o.quiet:
             out()
             out(f"{GREEN('up to date:')} {' '.join(uptodate)}")
         self.finish("pull")
@@ -884,7 +901,8 @@ class Run:
                 continue
             got = fetched_summary(res.err)
             line = repo_row(r, self.width, bwidth)
-            out(line + (f"  ({got})" if got else ""))
+            if got or not self.o.quiet or r.state.behind:
+                out(line + (f"  ({got})" if got else ""))
             self.count("fetched" if got else "nothing new", r)
         self.finish("fetch")
 
@@ -895,19 +913,19 @@ class Run:
             out(f"Will run:  git {shown([cmd, *args])}")
             out(f"in: {' '.join(r.name for r in self.repos)}")
             confirm("Continue?", self.o.yes)
-        blocks = Blocks()
+        blocks = Blocks(self.o.start if self.o.prefix else None)
         for r in self.repos:
             if live:
                 header(r.name)
                 res = git(r.path, cmd, *args, live=True)
             else:
-                res = git(r.path, cmd, *args, colour=True)
+                res = git(r.path, cmd, *args, colour=not self.o.prefix)
                 blocks.add(r, res)
             # exit 1 from grep / diff --exit-code means "no match" / "has differences", not failure
             if res.rc and not (res.rc == 1 and (cmd == "grep" or (cmd == "diff" and {"--exit-code", "--quiet"} & set(args)))):
                 self.fail(r, first_error(res) if res.err else f"git {cmd} exited with {res.rc}")
         blocks.close()
-        if not blocks.printed and not live:
+        if not blocks.printed and not live and not self.o.quiet and not self.o.prefix:
             out("(no output)" if shows else f"done in {plural(len(self.repos), 'repo')}")
         self.finish()
 
@@ -954,7 +972,7 @@ def list_repos(ws):
 
 class Options:
     def __init__(self):
-        self.picks, self.yes, self.start = [], False, Path.cwd()
+        self.picks, self.yes, self.quiet, self.prefix, self.start = [], False, False, False, Path.cwd()
 
 
 def usage():
@@ -980,6 +998,10 @@ def main(argv):
             o.picks.append(a.split("=", 1)[1])
         elif a in ("-y", "--yes"):
             o.yes = True
+        elif a in ("-q", "--quiet"):
+            o.quiet = True
+        elif a == "--prefix":
+            o.prefix = True
         elif a in ("-l", "--list"):
             return list_repos(find_workspace(o.start))
         elif a in ("-h", "--help"):

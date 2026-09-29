@@ -43,6 +43,8 @@ Put these **before** the git command.
 | `-l` | List the repos with their numbers |
 | `-C DIR` | Start in `DIR` instead of the current folder |
 | `-y` | Don't ask for confirmation (also allowed after the git command) |
+| `-q` | Leave out repos with nothing to report |
+| `--prefix` | Start each output line with the repo's path: `gitall --prefix grep -n TODO` |
 | `-h` | Help |
 
 ## What's different from plain git
@@ -76,6 +78,7 @@ gitall commit -am "Weekly edits" -y
 gitall commit -m "Fix slides" -- 'slides/*.tex'  # commit only matching files, in every repo
 gitall fetch            # then
 gitall pull
+gitall --prefix grep -n TODO
 ```
 
 ## Install
