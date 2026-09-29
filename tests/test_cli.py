@@ -5,7 +5,7 @@ import subprocess
 
 import pytest
 
-from conftest import ROOT, write
+from conftest import ROOT, git, write
 
 
 def test_no_command_prints_help(world, run):
@@ -44,6 +44,24 @@ def test_yes_after_the_git_command(world, run):
     r = run("tag", "v1", "-y", cwd=world.work, tty=False)
     assert r.code == 0, r
     assert "done in 1 repo" in r.out
+    assert git(world.work / "A", "tag") == "v1"
+
+
+def test_yes_is_only_taken_as_the_last_argument(world, run):
+    world.repo("A")
+    r = run("-y", "tag", "-a", "v2", "-m", "-y", cwd=world.work)  # -y is the message here
+    assert r.code == 0, r
+    assert git(world.work / "A", "tag", "-n1", "-l", "v2").split() == ["v2", "-y"]
+    r = run("tag", "-y", "v3", cwd=world.work, tty=False)  # not last: goes to git, which asks first
+    assert r.code == 2 and "not running interactively" in r.err
+
+
+def test_yes_after_double_dash_is_a_path(world, run):
+    a = world.repo("A")
+    write(a / "-y", "content\n")
+    r = run("-y", "add", "--", "-y", cwd=world.work)
+    assert r.code == 0, r
+    assert "A  -y" in git(a, "status", "--porcelain")
 
 
 def test_closed_stdin_in_a_real_process(world, run_script):

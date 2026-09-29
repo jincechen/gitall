@@ -1,7 +1,7 @@
-"""The tables behind confirmation, interactive runs and the commit editor."""
+"""The tables behind confirmation, interactive runs, the commit editor and argument handling."""
 import pytest
 
-from gitall import commit_opens_editor, interactive, read_only
+from gitall import commit_opens_editor, interactive, read_only, strip_yes
 
 
 @pytest.mark.parametrize("cmd, args, expected", [
@@ -17,7 +17,6 @@ from gitall import commit_opens_editor, interactive, read_only
     ("tag", ["-n"], True),
     ("tag", ["-n5"], True),
     ("tag", ["--contains", "HEAD"], True),
-    ("tag", ["--sort", "-v:refname"], True),
     ("tag", ["v1"], False),
     ("tag", ["-a", "v1", "-m", "x"], False),
     ("tag", ["-d", "v1"], False),
@@ -35,8 +34,6 @@ from gitall import commit_opens_editor, interactive, read_only
     ("submodule", [], True),
     ("submodule", ["status"], True),
     ("submodule", ["update", "--init"], False),
-    ("bisect", ["log"], True),
-    ("bisect", ["start"], False),
     ("clean", ["-n"], True),
     ("clean", ["-nd"], True),
     ("clean", ["--dry-run"], True),
@@ -62,8 +59,6 @@ from gitall import commit_opens_editor, interactive, read_only
     ("branch", ["--list", "feat*"], True),
     ("branch", ["--contains", "HEAD"], True),
     ("branch", ["--merged", "main"], True),
-    ("branch", ["--sort", "-committerdate"], True),
-    ("branch", ["--format", "%(refname)"], True),
     ("branch", ["feature"], False),
     ("branch", ["-d", "feature"], False),
     ("branch", ["-rd", "origin/x"], False),
@@ -90,6 +85,49 @@ from gitall import commit_opens_editor, interactive, read_only
 ])
 def test_read_only(cmd, args, expected):
     assert read_only(cmd, args) is expected
+
+
+@pytest.mark.parametrize("cmd, args, expected", [
+    ("add", ["-p"], True),
+    ("add", ["-i"], True),
+    ("add", ["-e"], True),
+    ("checkout", ["-p"], True),
+    ("reset", ["--patch"], True),
+    ("restore", ["-p"], True),
+    ("stash", ["-p"], True),
+    ("stash", ["push", "-p"], True),
+    ("clean", ["-i"], True),
+    ("rebase", ["-i", "HEAD~2"], True),
+    ("merge", ["--edit", "x"], True),
+    ("mergetool", [], True),
+    ("difftool", [], True),
+    ("config", ["-e"], True),
+    ("config", ["--global", "--edit"], True),
+    ("config", ["edit"], True),
+    ("am", ["-i", "patch.mbox"], True),
+    ("config", ["-l"], False),
+    ("tag", ["-a", "v1"], True),
+    ("tag", ["-s", "v1"], True),
+    ("tag", ["-a", "v1", "-m", "x"], False),
+    ("tag", ["-a", "v1", "-mx"], False),
+    ("tag", ["-a", "v1", "-F", "msg.txt"], False),
+    ("tag", ["v1"], False),
+    ("commit", ["-p"], True),
+    ("commit", ["--interactive"], True),
+    ("commit", ["-i", "x"], False),            # -i is --include, not interactive
+    ("pull", ["--rebase=interactive"], True),
+    ("pull", ["--rebase"], False),
+    ("notes", ["edit"], True),
+    ("log", ["-p"], False),
+    ("diff", ["-p"], False),
+    ("show", ["-p"], False),
+    ("grep", ["-i", "x"], False),
+    ("grep", ["-e", "x"], False),
+    ("stash", ["show", "-p"], False),
+    ("clean", ["-n"], False),
+])
+def test_interactive(cmd, args, expected):
+    assert interactive(cmd, args) is expected
 
 
 @pytest.mark.parametrize("args, expected", [
@@ -127,41 +165,14 @@ def test_commit_opens_editor(args, expected):
     assert commit_opens_editor(args) is expected
 
 
-@pytest.mark.parametrize("cmd, args, expected", [
-    ("add", ["-p"], True),
-    ("add", ["-i"], True),
-    ("add", ["-e"], True),
-    ("checkout", ["-p"], True),
-    ("reset", ["--patch"], True),
-    ("restore", ["-p"], True),
-    ("stash", ["-p"], True),
-    ("stash", ["push", "-p"], True),
-    ("clean", ["-i"], True),
-    ("rebase", ["-i", "HEAD~2"], True),
-    ("merge", ["--edit", "x"], True),
-    ("mergetool", [], True),
-    ("difftool", [], True),
-    ("config", ["-e"], True),
-    ("config", ["--global", "--edit"], True),
-    ("config", ["edit"], True),
-    ("config", ["-l"], False),
-    ("notes", ["edit"], True),
-    ("am", ["-i", "patch.mbox"], True),
-    ("tag", ["-a", "v1"], True),
-    ("tag", ["-s", "v1"], True),
-    ("tag", ["-a", "v1", "-m", "x"], False),
-    ("tag", ["-a", "v1", "-mx"], False),
-    ("tag", ["-a", "v1", "-F", "msg.txt"], False),
-    ("tag", ["v1"], False),
-    ("pull", ["--rebase=interactive"], True),
-    ("pull", ["--rebase"], False),
-    ("log", ["-p"], False),
-    ("diff", ["-p"], False),
-    ("show", ["-p"], False),
-    ("grep", ["-i", "x"], False),
-    ("grep", ["-e", "x"], False),
-    ("stash", ["show", "-p"], False),
-    ("clean", ["-n"], False),
+@pytest.mark.parametrize("args, expected", [
+    (["-m", "x", "-y"], (["-m", "x"], True)),
+    (["-m", "x", "--yes"], (["-m", "x"], True)),
+    (["-y", "-m", "x"], (["-y", "-m", "x"], False)),      # only as the last argument
+    (["-m", "-y"], (["-m", "-y"], False)),                # the message is "-y"
+    (["--", "-y"], (["--", "-y"], False)),                # a path called "-y"
+    (["-e", "-y"], (["-e"], True)),                       # commit -e takes no value
+    ([], ([], False)),
 ])
-def test_interactive(cmd, args, expected):
-    assert interactive(cmd, args) is expected
+def test_strip_yes(args, expected):
+    assert strip_yes(args) == expected

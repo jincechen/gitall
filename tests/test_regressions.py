@@ -24,6 +24,23 @@ def test_broken_repo_is_a_failure_not_a_skip(world, run):
     assert "Failed:\n  B:" in r.out
 
 
+def test_pathspec_matching_nothing_anywhere_is_an_error(world, run):
+    world.repo("A")
+    world.repo("B")
+    r = run("-y", "commit", "-m", "x", "--", "*.txe", cwd=world.work)
+    assert r.code == 1
+    assert "did not match any file(s) known to git" in r.err
+
+
+def test_misplaced_yes_gets_a_hint(world, run):
+    a = world.repo("A")
+    write(a / "main.tex", "changed\n")
+    r = run("commit", "-m", "x", "-y", "--", "main.tex", cwd=world.work, tty=False)
+    assert r.code == 1
+    assert "-y goes before the git command, or last" in r.out
+    assert "usage:" not in r.all
+
+
 def test_retry_line_keeps_dash_C(world, run):
     world.repo("A")
     world.repo("B")
