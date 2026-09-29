@@ -2,6 +2,11 @@
 from conftest import write
 
 
+def rows(result):
+    """The repo names at the start of compact one-line-per-repo output."""
+    return [line.split()[0] for line in result.out.splitlines() if line.strip()]
+
+
 def listed(result):
     """Repo names from `gitall -l` output, in order."""
     return [line.split(None, 1)[1] for line in result.out.splitlines()[1:]]
@@ -123,14 +128,14 @@ def test_select_by_position(world, run):
     for name in ("A", "B", "C"):
         world.repo(name, remote=False)
     r = run("-r", "3", "rev-parse", "--show-toplevel", cwd=world.work)
-    assert "== C" in r.out and "== A" not in r.out
+    assert rows(r) == ["C"]
 
 
 def test_several_selections_keep_the_list_order(world, run):
     for name in ("A", "B", "C"):
         world.repo(name, remote=False)
     r = run("-r", "C", "--repo=1", "-r", "a", "rev-parse", "--show-toplevel", cwd=world.work)
-    assert [ln for ln in r.out.splitlines() if ln.startswith("==")] == ["== A", "== C"]
+    assert rows(r) == ["A", "C"]
 
 
 def test_selection_matching_nothing_lists_the_repos(world, run):

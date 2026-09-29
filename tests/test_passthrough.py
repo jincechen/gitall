@@ -6,12 +6,27 @@ def headers(result):
     return [ln[3:] for ln in result.out.splitlines() if ln.startswith("== ")]
 
 
-def test_output_per_repo(world, run):
+def shown_repos(result):
+    """The repos that printed something: block headers, or the names starting compact rows."""
+    if headers(result):
+        return headers(result)
+    return [ln.split()[0] for ln in result.out.splitlines() if ln.strip()]
+
+
+def test_one_line_per_repo_prints_aligned_rows(world, run):
     world.repo("A")
-    world.repo("B")
+    world.repo("Bee")
     r = run("log", "-1", "--format=%s", cwd=world.work)
     assert r.code == 0
-    assert r.out.strip() == "== A\ninitial\n\n== B\ninitial"
+    assert r.out.strip() == "A    initial\nBee  initial"
+
+
+def test_longer_output_prints_blocks(world, run):
+    world.repo("A")
+    world.repo("B")
+    world.local_commit("B", {"x.tex": "x"}, "second")
+    r = run("log", "-2", "--format=%s", cwd=world.work)
+    assert r.out.strip() == "== A\ninitial\n\n== B\nsecond\ninitial"
 
 
 def test_repos_without_output_are_left_out(world, run):
@@ -19,7 +34,22 @@ def test_repos_without_output_are_left_out(world, run):
     world.repo("B")
     world.local_commit("B", {"x.tex": "x"}, "Unpushed")
     r = run("log", "--format=%s", "@{u}..HEAD", cwd=world.work)
-    assert headers(r) == ["B"]
+    assert r.out.strip() == "B  Unpushed"
+
+
+def test_quiet_leaves_out_the_no_output_note(world, run):
+    world.repo("A")
+    r = run("-q", "diff", cwd=world.work)
+    assert r.code == 0 and r.out == ""
+
+
+def test_git_messages_go_to_stderr(world, run):
+    world.repo("A")
+    world.repo("B")
+    r = run("-y", "branch", "-d", "no-such-branch", cwd=world.work)
+    assert r.code == 1
+    assert "error: branch 'no-such-branch' not found" in r.err
+    assert "A, B: error: branch 'no-such-branch' not found" in r.out  # same error, grouped
 
 
 def test_no_output_at_all(world, run):
@@ -42,7 +72,7 @@ def test_changes_with_yes(world, run):
     world.repo("B")
     r = run("-y", "tag", "v1", cwd=world.work)
     assert r.code == 0
-    assert "done in 2 repo(s)" in r.out
+    assert "done in 2 repos" in r.out
     assert git(world.work / "B", "tag") == "v1"
 
 
@@ -70,8 +100,9 @@ def test_one_failure_does_not_stop_the_others(world, run):
     git(b, "branch", "feature")
     r = run("rev-parse", "--verify", "-q", "feature", cwd=world.work)
     assert r.code == 1
-    assert headers(r) == ["B"]
+    assert shown_repos(r)[:1] == ["B"]
     assert "Failed:\n  A: git rev-parse exited with 1" in r.out
+    assert "retry:  gitall -r A rev-parse --verify -q feature" in r.out
 
 
 def test_changes_ask(world, run):
@@ -121,6 +152,28 @@ def test_stash_show_patch_does_not_ask(world, run):
     assert r.code == 0 and headers(r) == ["A"] and "+stashed" in r.out
 
 
+def test_prefix_puts_the_repo_path_in_front_of_each_line(world, run):
+    world.repo("A", {"main.tex": "x\n", "sub/b.tex": "y\n"})
+    world.repo("B")
+    r = run("--prefix", "ls-files", cwd=world.work)
+    assert r.code == 0
+    assert r.out.splitlines() == ["A/main.tex", "A/sub/b.tex", "B/main.tex"]
+
+
+def test_prefix_is_relative_to_where_you_are(world, run):
+    world.repo("A")
+    world.repo("B")
+    r = run("--prefix", "ls-files", cwd=world.work / "A")
+    assert r.out.splitlines() == ["main.tex", "../B/main.tex"]
+
+
+def test_prefix_with_grep(world, run):
+    world.repo("A", {"main.tex": "TODO here\n"})
+    world.repo("B")
+    r = run("--prefix", "grep", "-n", "TODO", cwd=world.work)
+    assert r.out.strip() == "A/main.tex:1:TODO here"
+
+
 def test_non_ascii_filenames_are_not_quoted(world, run):
     world.repo("A", {"Übung_讲义.tex": "x\n"})
     r = run("ls-files", cwd=world.work)
@@ -139,5 +192,5 @@ def test_log_patch_is_captured_not_interactive(world, run):
 def test_grep_ignore_case_and_pattern_are_captured(world, run):
     world.repo("A", {"main.tex": "Hello\n"})
     world.repo("B")
-    assert headers(run("grep", "-i", "hello", cwd=world.work)) == ["A"]
-    assert headers(run("grep", "-e", "Hello", cwd=world.work)) == ["A"]
+    assert shown_repos(run("grep", "-i", "hello", cwd=world.work)) == ["A"]
+    assert shown_repos(run("grep", "-e", "Hello", cwd=world.work)) == ["A"]

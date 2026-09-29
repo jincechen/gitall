@@ -43,7 +43,7 @@ def test_yes_after_the_git_command(world, run):
     world.repo("A")
     r = run("tag", "v1", "-y", cwd=world.work, tty=False)
     assert r.code == 0, r
-    assert "done in 1 repo(s)" in r.out
+    assert "done in 1 repo" in r.out
 
 
 def test_closed_stdin_in_a_real_process(world, run_script):
@@ -56,7 +56,7 @@ def test_closed_stdin_in_a_real_process(world, run_script):
 
 def test_non_ascii_output_when_redirected(world, run_script):
     # with a legacy console encoding, printing non-ASCII text used to raise UnicodeEncodeError
-    world.repo("讲义", {"Übung.tex": "x\n"})
+    world.repo("讲义", {"Übung.tex": "x\n", "other.tex": "y\n"})
     env = {"PYTHONIOENCODING": "cp1252", "PYTHONUTF8": "0"}
     r = run_script("ls-files", cwd=world.work, env=env)
     assert r.code == 0, r
