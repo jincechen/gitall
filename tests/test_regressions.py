@@ -2,7 +2,28 @@
 import pytest
 
 from conftest import git, write
-from gitall import read_only
+from gitall import absolutize, read_only
+
+
+@pytest.mark.parametrize("args", [["-am", "-Fix typo"], ["-am", "-tidy up"], ["-m", "-Fix"],
+                                  ["--message", "-Fix"], ["-e", "-m", "-Fix"]])
+def test_absolutize_leaves_messages_alone(args, tmp_path):
+    assert absolutize("commit", args, tmp_path) == args
+
+
+def test_absolutize_still_fixes_files_after_flags(tmp_path):
+    out = absolutize("commit", ["-e", "-F", "msg.txt"], tmp_path)
+    assert out[:2] == ["-e", "-F"] and out[2] == str(tmp_path / "msg.txt")
+    out = absolutize("commit", ["-aFmsg.txt"], tmp_path)
+    assert out == [f"-aF{tmp_path / 'msg.txt'}"]
+
+
+def test_commit_message_starting_with_dash_f(world, run):
+    a = world.repo("A")
+    write(a / "main.tex", "changed\n")
+    r = run("commit", "-am", "-Fix typo", "-y", cwd=world.work)
+    assert r.code == 0, r
+    assert git(a, "log", "-1", "--format=%s") == "-Fix typo"
 
 
 def test_push_with_arguments_does_not_crash(world, run):
@@ -22,6 +43,23 @@ def test_broken_repo_is_a_failure_not_a_skip(world, run):
     r = run("commit", "-am", "x", "-y", cwd=world.work)
     assert r.code == 1
     assert "Failed:\n  B:" in r.out
+
+
+def test_pathspec_matching_nothing_anywhere_is_an_error(world, run):
+    world.repo("A")
+    world.repo("B")
+    r = run("-y", "commit", "-m", "x", "--", "*.txe", cwd=world.work)
+    assert r.code == 1
+    assert "did not match any file(s) known to git" in r.err
+
+
+def test_misplaced_yes_gets_a_hint(world, run):
+    a = world.repo("A")
+    write(a / "main.tex", "changed\n")
+    r = run("commit", "-m", "x", "-y", "--", "main.tex", cwd=world.work, tty=False)
+    assert r.code == 1
+    assert "-y goes before the git command, or last" in r.out
+    assert "usage:" not in r.all
 
 
 def test_retry_line_keeps_dash_C(world, run):

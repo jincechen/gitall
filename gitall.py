@@ -23,7 +23,7 @@ Options (before the git command):
                     in the list (1, 2, ...); repeatable
   -l, --list        list the repos (with their numbers) and exit
   -C DIR            start in DIR instead of the current directory
-  -y, --yes         don't ask for confirmation (also accepted after the git command)
+  -y, --yes         don't ask for confirmation (also accepted as the last argument)
   -q, --quiet       leave out repos with nothing to report
   --prefix          start each output line with the repo's path (grep, ls-files, ...)
   -h, --help        show this help
@@ -33,6 +33,7 @@ nearest parent that has one); else every git repo directly inside the current
 directory; else, when run inside a repo, that repo and its sibling repos.
 `gitall -l` shows which repos it picked.
 """
+import errno
 import fnmatch
 import os
 import re
@@ -63,6 +64,7 @@ INTERACTIVE = {
     "stash": {"-p", "--patch"}, "clean": {"-i", "--interactive"}, "rebase": {"-i", "--interactive"},
     "merge": {"-e", "--edit"}, "revert": {"-e", "--edit"}, "cherry-pick": {"-e", "--edit"},
     "tag": {"-e", "--edit"}, "config": {"-e", "--edit"}, "am": {"-i", "--interactive"},
+    "commit": {"-p", "--patch", "--interactive"},
     "pull": {"--rebase=interactive", "--rebase=i", "-r=i", "-ri"},
 }
 # branch options that create, delete, rename or configure branches, and ones that list them
@@ -78,6 +80,20 @@ CONFIG_READS = {"-l", "--list", "--get", "--get-all", "--get-regexp", "--get-url
                 "--get-color", "--get-colorbool"}
 CONFIG_WRITES = {"--add", "--replace-all", "--unset", "--unset-all", "--rename-section",
                  "--remove-section", "-e", "--edit"}
+# options whose value is a file: made absolute, so they mean the file you're looking at
+FILE_OPTS = {
+    "commit": {"-F", "--file", "-t", "--template"}, "tag": {"-F", "--file"},
+    "merge": {"-F", "--file"}, "notes": {"-F", "--file"}, "archive": {"-o", "--output"},
+    "format-patch": {"-o", "--output-directory"}, "diff": {"--output"}, "log": {"--output"},
+    "show": {"--output"},
+}
+# options that take a value, so the value is never read as an option (commit -am "-Fix"):
+# short ones per command (they mean different things elsewhere), long ones everywhere
+SHORT_VALUES = {"commit": "mFCct", "tag": "mFu", "merge": "mF", "notes": "mFCc",
+                "archive": "o", "format-patch": "o"}
+LONG_VALUES = {"--message", "--file", "--template", "--author", "--date", "--trailer", "--cleanup",
+               "--format", "--pretty", "--grep", "--reuse-message", "--reedit-message", "--fixup",
+               "--squash", "--output", "--output-directory"}
 # branch/tag options whose value is the next argument (branch --sort -committerdate)
 LIST_VALUES = {"--sort", "--format", "--contains", "--no-contains", "--merged", "--no-merged",
                "--points-at", "-u", "--set-upstream-to", "-m", "--message", "-F", "--file"}
@@ -97,15 +113,29 @@ BOLD, RED, GREEN, YELLOW = _c("1"), _c("31"), _c("32"), _c("33")
 
 
 # ---- output --------------------------------------------------------------------------
+class PipeClosed(Exception):
+    """The reader of our output went away (gitall log | head)."""
+
+
+def _write(stream, text):
+    try:
+        stream.buffer.write(text.encode("utf-8", "replace"))
+        stream.flush()
+    except BrokenPipeError:
+        raise PipeClosed from None
+    except OSError as e:
+        if e.errno == errno.EINVAL:  # Windows says this for a closed pipe
+            raise PipeClosed from None
+        raise
+
+
 def out(text=""):
-    sys.stdout.buffer.write((text + "\n").encode("utf-8", "replace"))
-    sys.stdout.flush()
+    _write(sys.stdout, text + "\n")
 
 
 def err(text=""):
     sys.stdout.flush()
-    sys.stderr.buffer.write((text + "\n").encode("utf-8", "replace"))
-    sys.stderr.flush()
+    _write(sys.stderr, text + "\n")
 
 
 def die(msg, code=2):
@@ -532,6 +562,56 @@ def commit_opens_editor(args):
     return not {"m", "message", "F", "file", "C", "reuse-message", "fixup"} & opts.keys()
 
 
+def absolutize(cmd, args, start):
+    """Make file options (commit -F msg.txt, archive -o out.zip) relative to where gitall
+    was started, not to each repo."""
+    opts = FILE_OPTS.get(cmd, set()) | {"--pathspec-from-file"}
+    letters = SHORT_VALUES.get(cmd, "")
+
+    def fix(v):
+        return v if v == "-" or os.path.isabs(v) else os.path.normpath(os.path.join(start, v))
+    res, i = [], 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            return res + args[i - 1:]
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            if eq:
+                a = f"{name}={fix(val)}" if name in opts else a
+            elif (name in opts or name in LONG_VALUES) and i < len(args):
+                res += [a, fix(args[i]) if name in opts else args[i]]
+                i += 1
+                continue
+        elif a.startswith("-") and len(a) > 1:
+            # a cluster of short options (-am); the first one that takes a value ends it:
+            # the value is the rest of the word (-Fmsg.txt) or the next argument
+            for k, ch in enumerate(a[1:], 2):
+                if ch not in letters:
+                    continue
+                fixit = f"-{ch}" in opts
+                if k < len(a):
+                    a = a[:k] + (fix(a[k:]) if fixit else a[k:])
+                elif i < len(args):
+                    res += [a, fix(args[i]) if fixit else args[i]]
+                    i += 1
+                    a = None
+                break
+            if a is None:
+                continue
+        res.append(a)
+    return res
+
+
+def strip_yes(args):
+    """Remove a trailing -y/--yes (gitall's, not git's) -> (args, found)."""
+    if args and args[-1] in ("-y", "--yes") and "--" not in args[:-1] and \
+            not (len(args) > 1 and args[-2] in ("-m", "--message", "-F", "--file")):
+        return args[:-1], True
+    return args, False
+
+
 # ---- commands --------------------------------------------------------------------------
 class Blocks:
     """Each repo's output under a header. While every repo prints just one line, the lines
@@ -629,6 +709,8 @@ class Run:
         self.skipped.append((repo, why))
 
     def fail(self, repo, msg, retry=None):
+        if "unknown switch `y'" in msg or "unknown option `yes'" in msg:
+            msg += f" ({PROG}'s -y goes before the git command, or last)"
         self.failed.append((repo, msg, retry))
 
     def count(self, outcome, repo):
@@ -725,23 +807,40 @@ class Run:
 
     # -- commit
     def commit(self, args):
-        user_dry = "--dry-run" in args
-        editor = commit_opens_editor(args)
-        todo = []
+        opts = commit_options(args)
+        user_dry = "dry-run" in opts
+        live_commit = bool({"p", "patch", "interactive"} & opts.keys())
+        anything = live_commit or bool({"amend", "allow-empty"} & opts.keys())
+        repo_editor = commit_opens_editor(args)
+        todo, unmatched = [], []
         for r in self.plan():
-            rargs = [a.replace("{repo}", r.folder) for a in args]
-            dry = ["commit", "--dry-run", "--short", *[a for a in rargs if a != "--dry-run"]]
-            res = git(r.path, *dry, internal=True)
-            if res.rc != 0:  # nothing to commit here -- unless git reported a real error
-                if re.search(r"^(fatal|error):", res.err, re.M) and \
-                        "did not match any file(s) known to git" not in res.err:
-                    self.fail(r, first_error(res))
-                continue
-            todo.append((r, rargs))
+            rargs = absolutize("commit", [a.replace("{repo}", r.folder) for a in args], self.o.start)
             s = r.state
+            if live_commit:
+                if not (s.staged or s.modified):
+                    continue
+                res, text = None, "\n".join(s.files)
+            else:
+                dry = ["commit", "--dry-run", "--short", *[a for a in rargs if a != "--dry-run"]]
+                res = git(r.path, *dry, internal=True)
+                text = res.out
+            if res is not None and res.rc != 0:  # nothing to commit here -- unless git reported a real error
+                if "did not match any file(s) known to git" in res.err:
+                    unmatched.append(first_error(res))
+                    continue
+                if re.search(r"^(fatal|error):", res.err, re.M):
+                    self.fail(r, first_error(res))
+                    continue
+                if not anything:
+                    continue
+            todo.append((r, rargs))
             header(f"{r.name} ({branch_text(s)}{', ' + sync_text(s) if sync_text(s) else ''})")
-            out("\n".join(ln for ln in res.out.splitlines() if ln[:1] not in (" ", "?")))
+            lines = [ln for ln in text.splitlines() if ln[:1] not in (" ", "?")]
+            if lines:
+                out("\n".join(lines))
         if not todo:
+            if unmatched and not self.failed and len(unmatched) + len(self.skipped) == len(self.repos):
+                die(f"{unmatched[0]} (in any of the repos)", 1)
             if not self.failed:
                 out("nothing to commit (stage changes with  git add  first, or use  commit -a  or  "
                     "commit -- <paths>)")
@@ -750,11 +849,15 @@ class Run:
         if user_dry:
             out(f"(dry run: {plural(len(todo), 'repo')} would be committed)")
             self.finish()
-        if editor:
-            out(YELLOW("git will open an editor for the message in each repo."))
+        if repo_editor or live_commit:
+            out(YELLOW("git will open an editor (or ask questions) in each repo in turn."))
         confirm(f"Commit {plural(len(todo), 'repo')}?", self.o.yes)
         for r, rargs in todo:
-            res = git(r.path, "commit", *rargs, live=True) if editor else git(r.path, "commit", "-q", *rargs)
+            if repo_editor or live_commit:
+                header(r.name)
+                res = git(r.path, "commit", *rargs, live=True)
+            else:
+                res = git(r.path, "commit", "-q", *rargs)
             if res.rc == 0:
                 n = len((git_ok(r.path, "show", "--name-only", "--format=", "HEAD") or "").splitlines())
                 out(f"{r.name}: {GREEN('committed')} {git_ok(r.path, 'log', '-1', '--format=%h %s')} "
@@ -909,24 +1012,41 @@ class Run:
     # -- everything else
     def passthrough(self, cmd, args):
         live, shows = interactive(cmd, args), read_only(cmd, args)
+        todo = [(r, absolutize(cmd, args, self.o.start)) for r in self.repos]
         if not (shows or cmd in NO_CONFIRM):
             out(f"Will run:  git {shown([cmd, *args])}")
-            out(f"in: {' '.join(r.name for r in self.repos)}")
+            out(f"in: {' '.join(r.name for r, _ in todo)}")
             confirm("Continue?", self.o.yes)
+        rargs_of = dict(todo)
+        quiet_diff = cmd.startswith("diff") and bool({"--quiet", "--exit-code"} & set(args))
+        matched = differs = False
         blocks = Blocks(self.o.start if self.o.prefix else None)
-        for r in self.repos:
-            if live:
+        if live:
+            for r, _ in todo:
                 header(r.name)
-                res = git(r.path, cmd, *args, live=True)
-            else:
-                res = git(r.path, cmd, *args, colour=not self.o.prefix)
-                blocks.add(r, res)
+                res = git(r.path, cmd, *rargs_of[r], live=True)
+                if res.rc:
+                    self.fail(r, f"git {cmd} exited with {res.rc}")
+            self.finish()
+
+        def work(r):
+            return git(r.path, cmd, *rargs_of[r], colour=not self.o.prefix)
+        for r, res in ((r, work(r)) for r, _ in todo):
+            blocks.add(r, res)
             # exit 1 from grep / diff --exit-code means "no match" / "has differences", not failure
-            if res.rc and not (res.rc == 1 and (cmd == "grep" or (cmd == "diff" and {"--exit-code", "--quiet"} & set(args)))):
+            if cmd == "grep" and res.rc in (0, 1):
+                matched |= res.rc == 0
+            elif quiet_diff and res.rc in (0, 1):
+                differs |= res.rc == 1
+            elif res.rc:
                 self.fail(r, first_error(res) if res.err else f"git {cmd} exited with {res.rc}")
         blocks.close()
-        if not blocks.printed and not live and not self.o.quiet and not self.o.prefix:
-            out("(no output)" if shows else f"done in {plural(len(self.repos), 'repo')}")
+        if cmd == "grep":
+            self.code = 0 if matched else 1
+        elif quiet_diff:
+            self.code = 1 if differs else 0
+        if not blocks.printed and not self.o.quiet and "--quiet" not in args and not self.o.prefix:
+            out("(no output)" if shows else f"done in {plural(len(todo), 'repo')}")
         self.finish()
 
 
@@ -1016,15 +1136,22 @@ def main(argv):
         out(usage())
         return 2
     cmd, args = argv[i], argv[i + 1:]
-    if cmd in ("help", "version"):
+    args, yes = strip_yes(args)
+    o.yes |= yes
+    before_dashdash = args[:args.index("--")] if "--" in args else args
+    if cmd in ("help", "version") or args == ["-h"] or "--help" in before_dashdash:
         if cmd == "help" and not args:
             out(usage())
             return 0
-        return subprocess.call(["git", cmd, *args])  # once, not once per repo
-    if cmd in ("commit", "push", "pull") or cmd not in NO_CONFIRM:
-        if "-y" in args or "--yes" in args:
-            o.yes = True
-            args = [a for a in args if a not in ("-y", "--yes")]
+        return subprocess.call(["git", cmd, *args], cwd=o.start)  # once, not per repo
+    words = [a for a in args if not a.startswith("-")]
+    once = (cmd == "clone" and words) or (cmd == "init" and words) or cmd.startswith("credential") or \
+        (cmd == "config" and any(a in ("--global", "--system", "-f", "--file") or a.startswith("--file=")
+                                 for a in args))
+    if cmd == "init" and not words:
+        die(f"init creates a new repo; give its folder: {PROG} init <folder>")
+    if once:
+        return subprocess.call(["git", cmd, *args], cwd=o.start)
 
     ws = find_workspace(o.start)
     if not ws.repos:
@@ -1040,6 +1167,13 @@ def main(argv):
 
 if __name__ == "__main__":
     try:
-        sys.exit(main(sys.argv[1:]))
+        code = main(sys.argv[1:])
     except KeyboardInterrupt:
-        sys.exit(130)
+        code = 130
+    except PipeClosed:
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        code = 141 if os.name != "nt" else 1    # like git killed by SIGPIPE
+    sys.exit(code)
