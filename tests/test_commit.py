@@ -24,6 +24,7 @@ def test_commits_staged_changes_and_skips_repos_with_nothing(world, run):
     assert "== A (main)" in r.out and "A  intro.tex" in r.out
     assert "== B" not in r.out
     assert "A: committed" in r.out and "Add intro (1 file(s))" in r.out
+    assert "commit: 1 committed" in r.out
     assert last_message(a) == "Add intro"
     assert world.head("B") == before_b
 
@@ -79,7 +80,7 @@ def test_pathspec_commits_matching_files_and_no_match_is_not_an_error(world, run
     write(a / "main.tex", "2\n")
     write(a / "notes.md", "2\n")
     write(b / "notes.md", "2\n")
-    r = run("commit", "-m", "Fix decks", "-y", "--", "*.tex", cwd=world.work)
+    r = run("-y", "commit", "-m", "Fix decks", "--", "*.tex", cwd=world.work)
     assert r.code == 0, r
     assert "Failed" not in r.out
     assert git(a, "show", "--name-only", "--format=", "HEAD") == "main.tex"
@@ -131,33 +132,44 @@ def test_non_interactive_without_yes_aborts(world, run):
     assert world.head("A") == before
 
 
+# ---- the commit message editor ---------------------------------------------------------
+def counting_editor(monkeypatch, world, text):
+    """GIT_EDITOR that writes text as the message and counts how often it ran."""
+    count = world.root / "editor-runs"
+    monkeypatch.setenv("GIT_EDITOR", f"echo run >> '{count.as_posix()}'; echo '{text}' >")
+    return lambda: len(count.read_text().splitlines()) if count.exists() else 0
+
+
 def test_no_message_opens_the_editor_in_each_repo(world, run, monkeypatch):
-    monkeypatch.setenv("GIT_EDITOR", "echo from-editor >")
+    runs = counting_editor(monkeypatch, world, "from-editor")
     a, b = world.repo("A"), world.repo("B")
     for repo in (a, b):
         write(repo / "main.tex", "changed\n")
     r = run("commit", "-a", "-y", cwd=world.work)
     assert r.code == 0, r
-    assert "open an editor" in r.out
+    assert "git will open an editor (or ask questions) in each repo in turn." in r.out
+    assert runs() == 2
     assert last_message(a) == last_message(b) == "from-editor"
 
 
 @pytest.mark.parametrize("opts", [["-c", "HEAD"], ["--reedit-message=HEAD"], ["-m", "typed", "-e"],
-                                  ["--squash", "HEAD"], ["--fixup=amend:HEAD"]])
-def test_options_that_open_the_editor_run_attached(world, run, monkeypatch, opts):
-    monkeypatch.setenv("GIT_EDITOR", "echo from-editor >")
-    a = world.repo("A")
-    write(a / "main.tex", "changed\n")
-    git(a, "add", "-A")
+                                  ["--squash", "HEAD"], ["--fixup=amend:HEAD"], ["--amend"]])
+def test_options_that_need_gits_own_editor_open_it_per_repo(world, run, monkeypatch, opts):
+    runs = counting_editor(monkeypatch, world, "from-editor")
+    a, b = world.repo("A"), world.repo("B")
+    for repo in (a, b):
+        write(repo / "main.tex", "changed\n")
+        git(repo, "add", "-A")
     r = run("commit", *opts, "-y", cwd=world.work)
     assert r.code == 0, r
-    assert "open an editor" in r.out
+    assert "git will open an editor (or ask questions) in each repo in turn." in r.out
+    assert runs() == 2
     assert "from-editor" in git(a, "log", "-1", "--format=%B")
 
 
 @pytest.mark.parametrize("opts", [["-C", "HEAD"], ["--fixup", "HEAD"], ["-c", "HEAD", "--no-edit"],
-                                  ["-mEdited"], ["-F", "msg.txt"]])
-def test_options_that_give_the_message_dont_open_the_editor(world, run, opts):
+                                  ["-mEdited"], ["-F", "msg.txt"], ["--amend", "--no-edit"]])
+def test_options_that_give_the_message_dont_open_an_editor(world, run, opts):
     a = world.repo("A")
     write(world.work / "msg.txt", "From file\n")
     write(a / "main.tex", "changed\n")
@@ -165,7 +177,33 @@ def test_options_that_give_the_message_dont_open_the_editor(world, run, opts):
     r = run("commit", *[o if o != "msg.txt" else str(world.work / "msg.txt") for o in opts], "-y",
             cwd=world.work)
     assert r.code == 0, r  # GIT_EDITOR=false would have failed the commit
-    assert "open an editor" not in r.out
+    assert "editor" not in r.out
+
+
+# ---- commits that don't need changes -----------------------------------------------------
+def test_allow_empty_is_not_filtered_out(world, run):
+    a, b = world.repo("A"), world.repo("B")
+    r = run("commit", "--allow-empty", "-m", "Empty", "-y", cwd=world.work)
+    assert r.code == 0, r
+    assert last_message(a) == last_message(b) == "Empty"
+
+
+def test_amend_rewords_every_repo(world, run):
+    a, b = world.repo("A"), world.repo("B")
+    world.local_commit("B", {"x.tex": "x"}, "local")
+    r = run("commit", "--amend", "-m", "Reworded", "-y", cwd=world.work)
+    assert r.code == 0, r
+    assert last_message(a) == last_message(b) == "Reworded"
+
+
+def test_commit_patch_runs_attached_and_only_where_there_are_changes(world, run_script):
+    a = world.repo("A")
+    world.repo("B")
+    write(a / "main.tex", "changed\n")
+    r = run_script("commit", "-p", "-m", "x", "-y", cwd=world.work)  # stdin closed: nothing picked
+    assert "git will open an editor (or ask questions) in each repo in turn." in r.out
+    assert "== A" in r.out and "== B" not in r.out
+    assert last_message(a) == "initial"  # nothing was picked, so nothing committed
 
 
 def test_non_ascii_filenames_in_preview(world, run):

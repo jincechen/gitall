@@ -23,7 +23,7 @@ Options (before the git command):
                     in the list (1, 2, ...); repeatable
   -l, --list        list the repos (with their numbers) and exit
   -C DIR            start in DIR instead of the current directory
-  -y, --yes         don't ask for confirmation (also accepted after the git command)
+  -y, --yes         don't ask for confirmation (also accepted as the last argument)
   -q, --quiet       leave out repos with nothing to report
   --prefix          start each output line with the repo's path (grep, ls-files, ...)
   -h, --help        show this help
@@ -63,6 +63,7 @@ INTERACTIVE = {
     "stash": {"-p", "--patch"}, "clean": {"-i", "--interactive"}, "rebase": {"-i", "--interactive"},
     "merge": {"-e", "--edit"}, "revert": {"-e", "--edit"}, "cherry-pick": {"-e", "--edit"},
     "tag": {"-e", "--edit"}, "config": {"-e", "--edit"}, "am": {"-i", "--interactive"},
+    "commit": {"-p", "--patch", "--interactive"},
     "pull": {"--rebase=interactive", "--rebase=i", "-r=i", "-ri"},
 }
 # branch options that create, delete, rename or configure branches, and ones that list them
@@ -532,6 +533,14 @@ def commit_opens_editor(args):
     return not {"m", "message", "F", "file", "C", "reuse-message", "fixup"} & opts.keys()
 
 
+def strip_yes(args):
+    """Remove a trailing -y/--yes (gitall's, not git's) -> (args, found)."""
+    if args and args[-1] in ("-y", "--yes") and "--" not in args[:-1] and \
+            not (len(args) > 1 and args[-2] in ("-m", "--message", "-F", "--file")):
+        return args[:-1], True
+    return args, False
+
+
 # ---- commands --------------------------------------------------------------------------
 class Blocks:
     """Each repo's output under a header. While every repo prints just one line, the lines
@@ -629,6 +638,8 @@ class Run:
         self.skipped.append((repo, why))
 
     def fail(self, repo, msg, retry=None):
+        if "unknown switch `y'" in msg or "unknown option `yes'" in msg:
+            msg += f" ({PROG}'s -y goes before the git command, or last)"
         self.failed.append((repo, msg, retry))
 
     def count(self, outcome, repo):
@@ -725,23 +736,40 @@ class Run:
 
     # -- commit
     def commit(self, args):
-        user_dry = "--dry-run" in args
-        editor = commit_opens_editor(args)
-        todo = []
+        opts = commit_options(args)
+        user_dry = "dry-run" in opts
+        live_commit = bool({"p", "patch", "interactive"} & opts.keys())
+        anything = live_commit or bool({"amend", "allow-empty"} & opts.keys())
+        repo_editor = commit_opens_editor(args)
+        todo, unmatched = [], []
         for r in self.plan():
             rargs = [a.replace("{repo}", r.folder) for a in args]
-            dry = ["commit", "--dry-run", "--short", *[a for a in rargs if a != "--dry-run"]]
-            res = git(r.path, *dry, internal=True)
-            if res.rc != 0:  # nothing to commit here -- unless git reported a real error
-                if re.search(r"^(fatal|error):", res.err, re.M) and \
-                        "did not match any file(s) known to git" not in res.err:
-                    self.fail(r, first_error(res))
-                continue
-            todo.append((r, rargs))
             s = r.state
+            if live_commit:
+                if not (s.staged or s.modified):
+                    continue
+                res, text = None, "\n".join(s.files)
+            else:
+                dry = ["commit", "--dry-run", "--short", *[a for a in rargs if a != "--dry-run"]]
+                res = git(r.path, *dry, internal=True)
+                text = res.out
+            if res is not None and res.rc != 0:  # nothing to commit here -- unless git reported a real error
+                if "did not match any file(s) known to git" in res.err:
+                    unmatched.append(first_error(res))
+                    continue
+                if re.search(r"^(fatal|error):", res.err, re.M):
+                    self.fail(r, first_error(res))
+                    continue
+                if not anything:
+                    continue
+            todo.append((r, rargs))
             header(f"{r.name} ({branch_text(s)}{', ' + sync_text(s) if sync_text(s) else ''})")
-            out("\n".join(ln for ln in res.out.splitlines() if ln[:1] not in (" ", "?")))
+            lines = [ln for ln in text.splitlines() if ln[:1] not in (" ", "?")]
+            if lines:
+                out("\n".join(lines))
         if not todo:
+            if unmatched and not self.failed and len(unmatched) + len(self.skipped) == len(self.repos):
+                die(f"{unmatched[0]} (in any of the repos)", 1)
             if not self.failed:
                 out("nothing to commit (stage changes with  git add  first, or use  commit -a  or  "
                     "commit -- <paths>)")
@@ -750,11 +778,15 @@ class Run:
         if user_dry:
             out(f"(dry run: {plural(len(todo), 'repo')} would be committed)")
             self.finish()
-        if editor:
-            out(YELLOW("git will open an editor for the message in each repo."))
+        if repo_editor or live_commit:
+            out(YELLOW("git will open an editor (or ask questions) in each repo in turn."))
         confirm(f"Commit {plural(len(todo), 'repo')}?", self.o.yes)
         for r, rargs in todo:
-            res = git(r.path, "commit", *rargs, live=True) if editor else git(r.path, "commit", "-q", *rargs)
+            if repo_editor or live_commit:
+                header(r.name)
+                res = git(r.path, "commit", *rargs, live=True)
+            else:
+                res = git(r.path, "commit", "-q", *rargs)
             if res.rc == 0:
                 n = len((git_ok(r.path, "show", "--name-only", "--format=", "HEAD") or "").splitlines())
                 out(f"{r.name}: {GREEN('committed')} {git_ok(r.path, 'log', '-1', '--format=%h %s')} "
@@ -1016,15 +1048,13 @@ def main(argv):
         out(usage())
         return 2
     cmd, args = argv[i], argv[i + 1:]
+    args, yes = strip_yes(args)
+    o.yes |= yes
     if cmd in ("help", "version"):
         if cmd == "help" and not args:
             out(usage())
             return 0
         return subprocess.call(["git", cmd, *args])  # once, not once per repo
-    if cmd in ("commit", "push", "pull") or cmd not in NO_CONFIRM:
-        if "-y" in args or "--yes" in args:
-            o.yes = True
-            args = [a for a in args if a not in ("-y", "--yes")]
 
     ws = find_workspace(o.start)
     if not ws.repos:

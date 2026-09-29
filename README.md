@@ -42,7 +42,7 @@ Put these **before** the git command.
 | `-r N` | Only the N-th repo in the list |
 | `-l` | List the repos with their numbers |
 | `-C DIR` | Start in `DIR` instead of the current folder |
-| `-y` | Don't ask for confirmation (also allowed after the git command) |
+| `-y` | Don't ask for confirmation (also allowed as the last argument) |
 | `-q` | Leave out repos with nothing to report |
 | `--prefix` | Start each output line with the repo's path: `gitall --prefix grep -n TODO` |
 | `-h` | Help |
