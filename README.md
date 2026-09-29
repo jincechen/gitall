@@ -45,6 +45,7 @@ Put these **before** the git command.
 | `-y` | Don't ask for confirmation (also allowed as the last argument) |
 | `-q` | Leave out repos with nothing to report |
 | `--prefix` | Start each output line with the repo's path: `gitall --prefix grep -n TODO` |
+| `-c name=value`, `--no-pager`, `--literal-pathspecs`, ... | git's own options, passed on to git |
 | `-h` | Help |
 
 ## What's different from plain git

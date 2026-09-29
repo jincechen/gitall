@@ -26,6 +26,8 @@ Options (before the git command):
   -y, --yes         don't ask for confirmation (also accepted as the last argument)
   -q, --quiet       leave out repos with nothing to report
   --prefix          start each output line with the repo's path (grep, ls-files, ...)
+  -c NAME=VALUE, --no-pager, --literal-pathspecs, ...
+                    git's own options are passed on to git
   -h, --help        show this help
 
 Which repos: the folders listed in a .gitall file (in the current directory or the
@@ -37,6 +39,7 @@ import errno
 import fnmatch
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -55,6 +58,13 @@ READ_ONLY = {
     "verify-tag", "fsck",
 }
 NO_CONFIRM = READ_ONLY | {"add", "pull"}
+# commands with their own handling, and other common built-ins: never looked up as aliases
+COMMON = READ_ONLY | {
+    "add", "pull", "push", "commit", "switch", "checkout", "branch", "merge", "rebase", "reset",
+    "restore", "stash", "tag", "remote", "config", "clean", "rm", "mv", "init", "clone", "help",
+    "version", "reflog", "worktree", "notes", "submodule", "cherry-pick", "revert", "am",
+    "apply", "archive", "format-patch", "gc", "maintenance", "bisect", "mergetool", "difftool",
+}
 
 # options that make a command interactive (run attached to the terminal), per command;
 # the same letters mean something else elsewhere (log -p, grep -i, grep -e)
@@ -98,15 +108,21 @@ LONG_VALUES = {"--message", "--file", "--template", "--author", "--date", "--tra
 LIST_VALUES = {"--sort", "--format", "--contains", "--no-contains", "--merged", "--no-merged",
                "--points-at", "-u", "--set-upstream-to", "-m", "--message", "-F", "--file"}
 
+# git's own options that may come before the command: passed on to every git call
+GIT_FLAGS = {"--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs",
+             "--no-optional-locks", "--no-replace-objects", "--no-lazy-fetch", "--no-advice"}
+GIT_REFUSED = ("--git-dir", "--work-tree", "--namespace", "--bare", "--exec-path", "-p", "--paginate")
+
 STATUS_FILES = 10                       # changed files listed per repo by status
 
+NO_COLOR = bool(os.environ.get("NO_COLOR"))
 TTY = sys.stdout.isatty()
 if os.name == "nt" and TTY:
     os.system("")  # enable ANSI colours in the Windows console
 
 
 def _c(code):
-    return lambda t: f"\033[{code}m{t}\033[0m" if TTY else t
+    return lambda t: f"\033[{code}m{t}\033[0m" if TTY and not NO_COLOR else t
 
 
 BOLD, RED, GREEN, YELLOW = _c("1"), _c("31"), _c("32"), _c("33")
@@ -190,6 +206,9 @@ def confirm(question, yes):
 
 
 # ---- running git ---------------------------------------------------------------------
+USER_OPTS = []      # git's own options from the command line, e.g. ["-c", "core.abbrev=12"]
+
+
 class Res:
     def __init__(self, rc, out_, err_):
         self.rc, self.out, self.err = rc, out_, err_
@@ -204,11 +223,12 @@ def git(cwd, *args, live=False, colour=False, internal=False):
     internal: for gitall's own queries (plain, uncoloured output);
     live: attached to the terminal (editors, prompts)."""
     if internal:
-        cmd = ["git", "-c", "core.quotePath=false", "-c", "color.ui=never"]
+        cmd = ["git", *USER_OPTS, "-c", "core.quotePath=false", "-c", "color.ui=never"]
     else:
         cmd = ["git", "-c", "core.quotePath=false"]
-        if colour and TTY:
+        if colour and TTY and not NO_COLOR:
             cmd += ["-c", "color.ui=always"]
+        cmd += USER_OPTS
     cmd += ["--no-pager", *args]
     if live:
         return Res(subprocess.call(cmd, cwd=cwd), "", "")
@@ -612,6 +632,33 @@ def strip_yes(args):
     return args, False
 
 
+_builtins = None
+
+
+def resolve_alias(cmd, args, cwd):
+    """Expand git aliases -> (cmd, args, kind, chain); kind is 'shell' for !aliases."""
+    global _builtins
+    chain = []
+    for _ in range(10):
+        if cmd in COMMON:
+            break
+        val = git_ok(cwd, "config", "--get", f"alias.{cmd}")
+        if val is None:
+            break
+        if _builtins is None:
+            _builtins = set((git_ok(cwd, "--list-cmds=main,nohelpers") or "").split())
+        if cmd in _builtins:  # git ignores aliases that hide its own commands
+            break
+        chain.append(f"{cmd} = {val}")
+        if val.startswith("!"):
+            return cmd, args, "shell", chain
+        parts = shlex.split(val)
+        if not parts:
+            break
+        cmd, args = parts[0], parts[1:] + args
+    return cmd, args, "git", chain
+
+
 # ---- commands --------------------------------------------------------------------------
 class Blocks:
     """Each repo's output under a header. While every repo prints just one line, the lines
@@ -751,7 +798,7 @@ class Run:
     def command_line(self, repos, argv):
         where = ["-C", quote(str(self.o.start))] if key(self.o.start) != key(Path.cwd()) else []
         return " ".join([PROG, *where, "-r", quote(",".join(r.name for r in repos)),
-                         *(quote(a) for a in argv)])
+                         *(quote(a) for a in USER_OPTS), *(quote(a) for a in argv)])
 
     def plan(self):
         """The repos that are safe to change; skips the others."""
@@ -1010,10 +1057,13 @@ class Run:
         self.finish("fetch")
 
     # -- everything else
-    def passthrough(self, cmd, args):
-        live, shows = interactive(cmd, args), read_only(cmd, args)
+    def passthrough(self, cmd, args, alias=None):
+        live = interactive(cmd, args)
+        shows = read_only(cmd, args) and alias != "shell"
         todo = [(r, absolutize(cmd, args, self.o.start)) for r in self.repos]
         if not (shows or cmd in NO_CONFIRM):
+            if alias == "shell":
+                out(f"'{cmd}' is a shell alias: {self.o.alias_chain[-1]}")
             out(f"Will run:  git {shown([cmd, *args])}")
             out(f"in: {' '.join(r.name for r, _ in todo)}")
             confirm("Continue?", self.o.yes)
@@ -1093,6 +1143,7 @@ def list_repos(ws):
 class Options:
     def __init__(self):
         self.picks, self.yes, self.quiet, self.prefix, self.start = [], False, False, False, Path.cwd()
+        self.alias_chain = []
 
 
 def usage():
@@ -1101,21 +1152,28 @@ def usage():
 
 def main(argv):
     o, i = Options(), 0
+    USER_OPTS.clear()
+    with_value = {"-r": "picks", "--repo": "picks", "-C": "start", "-c": "config", "--config-env": "config-env"}
     while i < len(argv):
         a = argv[i]
-        if a in ("-r", "--repo", "-C"):
-            if i + 1 >= len(argv):
-                die(f"{a} needs a value")
-            if a == "-C":
-                o.start = (o.start / argv[i + 1]).resolve()
+        name, eq, value = a.partition("=") if a.startswith("--") else (a, "", "")
+        if name in with_value:
+            if not eq:
+                if i + 1 >= len(argv):
+                    die(f"{a} needs a value")
+                value = argv[i + 1]
+                i += 1
+            what = with_value[name]
+            if what in ("picks", "drops"):
+                getattr(o, what).append(value)
+            elif what == "start":
+                o.start = (o.start / value).resolve()
                 if not o.start.is_dir():
                     die(f"-C: no such directory: {o.start}")
+            elif what == "config":
+                USER_OPTS.extend(["-c", value])
             else:
-                o.picks.append(argv[i + 1])
-            i += 2
-            continue
-        if a.startswith("--repo="):
-            o.picks.append(a.split("=", 1)[1])
+                USER_OPTS.append(f"--config-env={value}")
         elif a in ("-y", "--yes"):
             o.yes = True
         elif a in ("-q", "--quiet"):
@@ -1127,6 +1185,16 @@ def main(argv):
         elif a in ("-h", "--help"):
             out(usage())
             return 0
+        elif a in ("--version", "-v"):
+            return subprocess.call(["git", "--version"])
+        elif a in GIT_FLAGS:
+            USER_OPTS.append(a)
+        elif a in ("--no-pager", "-P"):
+            pass                            # gitall never pages
+        elif name in GIT_REFUSED:
+            hint = "pipe the output to less instead" if a in ("-p", "--paginate") else \
+                "it would point every repo at the same place"
+            die(f"{a} doesn't work with {PROG}: {hint}")
         elif a.startswith("-"):
             die(f"unknown option '{a}' ({PROG}'s own options go before the git command; see {PROG} -h)")
         else:
@@ -1138,12 +1206,13 @@ def main(argv):
     cmd, args = argv[i], argv[i + 1:]
     args, yes = strip_yes(args)
     o.yes |= yes
+    cmd, args, kind, o.alias_chain = resolve_alias(cmd, args, o.start)
     before_dashdash = args[:args.index("--")] if "--" in args else args
     if cmd in ("help", "version") or args == ["-h"] or "--help" in before_dashdash:
         if cmd == "help" and not args:
             out(usage())
             return 0
-        return subprocess.call(["git", cmd, *args], cwd=o.start)  # once, not per repo
+        return subprocess.call(["git", *USER_OPTS, cmd, *args], cwd=o.start)  # once, not per repo
     words = [a for a in args if not a.startswith("-")]
     once = (cmd == "clone" and words) or (cmd == "init" and words) or cmd.startswith("credential") or \
         (cmd == "config" and any(a in ("--global", "--system", "-f", "--file") or a.startswith("--file=")
@@ -1151,13 +1220,15 @@ def main(argv):
     if cmd == "init" and not words:
         die(f"init creates a new repo; give its folder: {PROG} init <folder>")
     if once:
-        return subprocess.call(["git", cmd, *args], cwd=o.start)
+        return subprocess.call(["git", *USER_OPTS, cmd, *args], cwd=o.start)
 
     ws = find_workspace(o.start)
     if not ws.repos:
         die(f"no git repos found in {ws.root} (run it in or inside the folder that contains "
             f"your repos, or list them in a {CONFIG} file)")
     run = Run(ws, select(ws, o.picks), o, [cmd, *args])
+    if kind == "shell":
+        return run.passthrough(cmd, args, alias="shell")
     handler = {"status": run.status, "commit": run.commit, "push": run.push,
                "pull": run.pull, "fetch": run.fetch}.get(cmd)
     if handler:
