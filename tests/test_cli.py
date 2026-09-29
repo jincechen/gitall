@@ -84,6 +84,18 @@ def test_non_ascii_output_when_redirected(world, run_script):
     assert "(repos: 1:讲义)" in r.err
 
 
+def test_closed_pipe_exits_quietly(world, run_script):
+    for i in range(30):
+        world.repo(f"R{i}", {f"f{j}.tex": "x\n" for j in range(30)}, remote=False)
+    p = subprocess.Popen([os.sys.executable, str(ROOT / "gitall.py"), "ls-files"], cwd=world.work,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p.stdout.read(10)
+    p.stdout.close()
+    err = p.stderr.read().decode("utf-8", "replace")
+    p.wait(timeout=60)
+    assert "Traceback" not in err and "Exception ignored" not in err
+
+
 def test_gitall_file_is_read_as_utf8(world, run):
     world.repo("Übung", remote=False)
     write(world.work / ".gitall", "Übung\n")
