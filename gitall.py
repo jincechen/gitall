@@ -18,22 +18,35 @@ arguments mean what they mean in git. A few commands get extra help:
   anything else   runs in every repo; repos with no output are left out; commands
                   that change things show what will run and ask first
 
-Options (before the git command):
-  -r, --repo NAME   only repos whose folder name contains NAME, or the NAME-th repo
-                    in the list (1, 2, ...); repeatable
-  -l, --list        list the repos (with their numbers) and exit
-  -C DIR            start in DIR instead of the current directory
-  -y, --yes         don't ask for confirmation (also accepted as the last argument)
-  -q, --quiet       leave out repos with nothing to report
-  --prefix          start each output line with the repo's path (grep, ls-files, ...)
-  -c NAME=VALUE, --no-pager, --literal-pathspecs, ...
-                    git's own options are passed on to git
-  -h, --help        show this help
+Choosing repos (these options go before the git command):
+  -r, --repo SPEC     only these repos. SPEC is a comma-separated list of:
+                        name      the repo's name, else part of a name (any case)
+                        glob      e.g. 'Deck*'
+                        N, N-M    positions in the list (see -l)
+                        group     a [group] from .gitall
+                        :state    dirty clean staged modified untracked ahead behind
+                                  diverged noupstream stash merging detached
+                                  on=BRANCH has=BRANCH
+                        !term     leave these out
+                      names and groups add up; :states keep the repos in any of
+                      them, e.g.  -r decks -r :dirty,:ahead
+  -x, --exclude SPEC  leave these repos out
+  -l, --list          list the chosen repos with their numbers and state
 
-Which repos: the folders listed in a .gitall file (in the current directory or the
-nearest parent that has one); else every git repo directly inside the current
-directory; else, when run inside a repo, that repo and its sibling repos.
-`gitall -l` shows which repos it picked.
+Other options:
+  -y, --yes           don't ask for confirmation (also accepted as the last argument)
+  -q, --quiet         leave out repos with nothing to report
+  --prefix            start each output line with the repo's path (grep, ls-files, ...)
+  -C DIR              start in DIR instead of the current directory
+  -c NAME=VALUE, --no-pager, --literal-pathspecs, ...
+                      git's own options are passed on to git
+  -h, --help          show this help
+
+Which repos: those listed in the nearest .gitall file (in the current directory or a
+parent); else every git repo directly inside the current directory; else, inside a
+repo, that repo and its siblings. A .gitall file has one entry per line: a name, a
+path or a glob ('Deck*', 'archive/*'); '!entry' leaves repos out; '[name]' starts a
+group and '[]' ends it; # starts a comment.
 """
 import errno
 import fnmatch
@@ -113,6 +126,7 @@ GIT_FLAGS = {"--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "-
              "--no-optional-locks", "--no-replace-objects", "--no-lazy-fetch", "--no-advice"}
 GIT_REFUSED = ("--git-dir", "--work-tree", "--namespace", "--bare", "--exec-path", "-p", "--paginate")
 
+GLOB_CHARS = "*?["
 STATUS_FILES = 10                       # changed files listed per repo by status
 
 NO_COLOR = bool(os.environ.get("NO_COLOR"))
@@ -276,6 +290,14 @@ def git_dir(path):
     return None
 
 
+def worktree_of(path):
+    """The main repo's folder if path is a linked worktree, else None."""
+    if not (path / ".git").is_file():
+        return None
+    d = git_dir(path)
+    return d.parent.parent.parent if d and d.parent.name == "worktrees" else None
+
+
 def subdirs(d):
     try:
         return sorted((p for p in d.iterdir() if p.is_dir()), key=lambda p: natural(p.name))
@@ -301,7 +323,7 @@ class State:
         self.ahead = self.behind = self.stash = 0
         self.staged = self.modified = self.untracked = self.conflicts = 0
         self.files = []
-        self._remotes = None
+        self._refs = self._remotes = None
         self.gitdir = git_dir(path)
         gd = self.gitdir
         self.op = next((op for f, op in OPS if gd and (gd / f).exists()), None)
@@ -371,6 +393,29 @@ class State:
             self._remotes = (git_ok(self.path, "remote") or "").split()
         return self._remotes
 
+    def refs(self):
+        """(local branches, {remote: branches}, {remote: its default branch})"""
+        if self._refs is None:
+            local, remote, heads = set(), {}, {}
+            text = git_ok(self.path, "for-each-ref", "--format=%(refname)%09%(symref)",
+                          "refs/heads", "refs/remotes") or ""
+            for line in text.splitlines():
+                ref, _, sym = line.partition("\t")
+                if ref.startswith("refs/heads/"):
+                    local.add(ref[11:])
+                elif ref.startswith("refs/remotes/"):
+                    rem, _, b = ref[13:].partition("/")
+                    if b != "HEAD":
+                        remote.setdefault(rem, set()).add(b)
+                    elif sym.startswith(f"refs/remotes/{rem}/"):
+                        heads[rem] = sym[len(f"refs/remotes/{rem}/"):]
+            self._refs = local, remote, heads
+        return self._refs
+
+    def has_branch(self, pattern):
+        local, remote, _ = self.refs()
+        return any(fnmatch.fnmatchcase(b, pattern) for b in local.union(*remote.values()))
+
     def fetched(self):
         """Seconds since the last fetch, or None if never."""
         for d in (self.gitdir, self.gitdir and self.gitdir.parent.parent):
@@ -405,7 +450,7 @@ class Repo:
 class Workspace:
     def __init__(self, root, config=None):
         self.root, self.config = root, config
-        self.repos, self.groups = [], {}
+        self.repos, self.groups, self.hidden, self.warnings = [], {}, [], []
 
 
 def find_workspace(start):
@@ -423,28 +468,111 @@ def find_workspace(start):
         if top:
             ws.root = Path(top).resolve().parent
             found = [p for p in subdirs(ws.root) if is_repo(p)]
-    ws.repos = [Repo(p, ws.root) for p in found]
+    keys, here = {key(p) for p in found}, key(start)
+    for p in found:
+        main = worktree_of(p)
+        inside = here == key(p) or here.startswith(key(p) + os.sep)
+        if main is not None and key(main) in keys and not inside:
+            ws.hidden.append(f"{p.name} (worktree of {main.name})")
+        else:
+            ws.repos.append(Repo(p, ws.root))
     return ws
+
+
+def config_entry(root, entry):
+    """The repos an entry of .gitall names: a name, a path, or globs per path part."""
+    paths = [root]
+    for part in entry.split("/"):
+        if any(ch in part for ch in GLOB_CHARS):
+            paths = [c for d in paths for c in subdirs(d) if fnmatch.fnmatchcase(c.name, part)
+                     and (part.startswith(".") or not c.name.startswith("."))]
+        else:
+            paths = [d / part for d in paths]
+    return [p for p in paths if is_repo(p)]
 
 
 def read_config(root, cfg):
     ws = Workspace(root, cfg)
-    known = {}
-    for n, raw in enumerate(cfg.read_text(encoding="utf-8").splitlines(), 1):
-        entry = raw.split("#", 1)[0].strip().rstrip("/\\")
-        if not entry:
+    known, excluded, group = {}, set(), None
+    for n, raw in enumerate(cfg.read_text(encoding="utf-8-sig").splitlines(), 1):
+        line = re.sub(r"(^|\s)#.*", "", raw).strip()    # '#' starts a comment, 'C#' doesn't
+        if not line:
             continue
-        if any(ch in entry for ch in "*?["):
-            hits = [p for p in subdirs(root) if fnmatch.fnmatchcase(p.name, entry) and is_repo(p)]
-        else:
-            hits = [root / entry] if is_repo(root / entry) else []
+        m = re.fullmatch(r"\[\s*(.*?)\s*\]", line)
+        if m:
+            group = m.group(1) or None                    # [] ends the group
+            if group:
+                ws.groups.setdefault(group.lower(), (group, []))
+            continue
+        exclude = line.startswith("!")
+        entry = line.lstrip("!").strip()
+        entry = entry.replace("\\", "/").rstrip("/")
+        hits = config_entry(root, entry)
+        if exclude:
+            excluded |= {key(p) for p in hits}
+            continue
         if not hits:
-            die(f"{cfg}, line {n}: '{entry}' is not a git repo")
+            ws.warnings.append(f"{cfg}, line {n}: '{entry}' is not a git repo, left out")
+            continue
         for p in hits:
-            if key(p) not in known:
-                known[key(p)] = Repo(p, root)
-                ws.repos.append(known[key(p)])
+            r = known.get(key(p))
+            if r is None:
+                r = known[key(p)] = Repo(p, root)
+                ws.repos.append(r)
+            if group and r not in ws.groups[group.lower()][1]:
+                ws.groups[group.lower()][1].append(r)
+    ws.repos = [r for r in ws.repos if key(r.path) not in excluded]
+    for g, (name, members) in ws.groups.items():
+        ws.groups[g] = (name, [r for r in members if key(r.path) not in excluded])
     return ws
+
+
+STATE_TESTS = {
+    "dirty": lambda s: s.dirty,
+    "clean": lambda s: not s.dirty,
+    "staged": lambda s: s.staged > 0,
+    "modified": lambda s: s.modified > 0,
+    "untracked": lambda s: s.untracked > 0,
+    "ahead": lambda s: s.tracking and s.ahead > 0,
+    "behind": lambda s: s.tracking and s.behind > 0,
+    "diverged": lambda s: s.tracking and s.ahead > 0 and s.behind > 0,
+    "noupstream": lambda s: not s.tracking,
+    "stash": lambda s: s.stash > 0,
+    "merging": lambda s: s.op is not None,
+    "detached": lambda s: s.detached,
+}
+
+
+def state_test(term):
+    """A test for ':name' or ':on=BRANCH' / ':has=BRANCH' (term without the colon)."""
+    name, eq, value = term.partition("=")
+    if eq and name == "on":
+        test = lambda s: fnmatch.fnmatchcase(s.branch or "", value)  # noqa: E731
+    elif eq and name == "has":
+        test = lambda s: s.has_branch(value)  # noqa: E731
+    elif not eq and name in STATE_TESTS:
+        test = STATE_TESTS[name]
+    else:
+        die(f"unknown state ':{term}' (states: {' '.join(STATE_TESTS)} on=BRANCH has=BRANCH)")
+    return lambda r: not r.state.error and test(r.state)
+
+
+def match_term(ws, term):
+    """The repos a name, glob, position, range or group stands for."""
+    t, repos = term.lower(), ws.repos
+    m = re.fullmatch(r"(\d+)(?:-(\d+))?", term)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        return repos[lo - 1:hi] if 1 <= lo <= hi <= len(repos) else []
+    if t in ws.groups:
+        return ws.groups[t][1]
+    exact = [r for r in repos if t in (r.name.lower(), r.folder.lower())]
+    if exact:
+        return exact
+    if any(ch in t for ch in GLOB_CHARS):
+        return [r for r in repos if fnmatch.fnmatchcase(r.name.lower(), t)
+                or fnmatch.fnmatchcase(r.folder.lower(), t)]
+    return [r for r in repos if t in r.name.lower()]
 
 
 def no_match(ws, term):
@@ -453,20 +581,39 @@ def no_match(ws, term):
     die(f"no repo matches '{term}' (repos: {listing}{groups})")
 
 
-def select(ws, picks):
-    """The repos chosen by -r, in list order."""
-    if not picks:
-        return ws.repos
-    chosen = set()
-    for term in picks:
-        if term.isdigit():
-            hits = ws.repos[int(term) - 1:int(term)] if 1 <= int(term) <= len(ws.repos) else []
+def select(ws, picks, drops):
+    """The repos chosen by -r (picks) and -x (drops), in list order."""
+    names, states, excluded = [], [], []
+    for spec in picks:
+        for term in (t.strip() for t in spec.split(",")):
+            if term.startswith("!"):
+                excluded.append(term[1:])
+            elif term.startswith(":"):
+                states.append(state_test(term[1:]))
+            elif term:
+                names.append(term)
+    excluded += [t.strip().lstrip("!") for spec in drops for t in spec.split(",") if t.strip()]
+    chosen = ws.repos
+    if names:
+        hits = set()
+        for term in names:
+            found = match_term(ws, term)
+            if not found:
+                no_match(ws, term)
+            hits.update(found)
+        chosen = [r for r in ws.repos if r in hits]
+    if states:
+        chosen = [r for r in chosen if any(test(r) for test in states)]
+    for term in excluded:
+        if term.startswith(":"):
+            test = state_test(term[1:])
+            chosen = [r for r in chosen if not test(r)]
         else:
-            hits = [r for r in ws.repos if term.lower() in r.name.lower()]
-        if not hits:
-            no_match(ws, term)
-        chosen.update(hits)
-    return [r for r in ws.repos if r in chosen]
+            found = match_term(ws, term)
+            if not found:
+                no_match(ws, term)
+            chosen = [r for r in chosen if r not in found]
+    return chosen
 
 
 # ---- what a command does -------------------------------------------------------------
@@ -1133,17 +1280,26 @@ def fetched_summary(text):
     return ", ".join(f"{n} {k}" for k, n in counts.items())
 
 
-def list_repos(ws):
-    out(f"{len(ws.repos)} repo(s) in {ws.root}" + (f" (from {CONFIG})" if ws.config else ""))
-    for n, r in enumerate(ws.repos, 1):
-        out(f"{n:3}  {r.name}")
+def list_repos(ws, chosen, picked):
+    where = f"in {ws.root}" + (f" (from {CONFIG})" if ws.config else "")
+    total = f"{len(chosen)} of {len(ws.repos)}" if picked else f"{len(ws.repos)}"
+    out(f"{total} repo(s) {where}")
+    if chosen:
+        width = max(len(r.name) for r in chosen)
+        bwidth = min(30, max(len(branch_text(r.state)) for r in chosen))
+        for r in chosen:
+            out(f"{ws.repos.index(r) + 1:3}  {repo_row(r, width, bwidth)}")
+    if ws.groups:
+        out("groups: " + ", ".join(f"{name} ({len(rs)})" for name, rs in ws.groups.values()))
+    if ws.hidden:
+        out("left out: " + ", ".join(ws.hidden))
     return 0
 
 
 class Options:
     def __init__(self):
-        self.picks, self.yes, self.quiet, self.prefix, self.start = [], False, False, False, Path.cwd()
-        self.alias_chain = []
+        self.picks, self.drops, self.yes, self.quiet, self.prefix = [], [], False, False, False
+        self.jobs, self.list, self.start, self.alias_chain = None, False, Path.cwd(), []
 
 
 def usage():
@@ -1153,7 +1309,8 @@ def usage():
 def main(argv):
     o, i = Options(), 0
     USER_OPTS.clear()
-    with_value = {"-r": "picks", "--repo": "picks", "-C": "start", "-c": "config", "--config-env": "config-env"}
+    with_value = {"-r": "picks", "--repo": "picks", "-x": "drops", "--exclude": "drops",
+                  "-C": "start", "-c": "config", "--config-env": "config-env"}
     while i < len(argv):
         a = argv[i]
         name, eq, value = a.partition("=") if a.startswith("--") else (a, "", "")
@@ -1178,10 +1335,10 @@ def main(argv):
             o.yes = True
         elif a in ("-q", "--quiet"):
             o.quiet = True
+        elif a in ("-l", "--list"):
+            o.list = True
         elif a == "--prefix":
             o.prefix = True
-        elif a in ("-l", "--list"):
-            return list_repos(find_workspace(o.start))
         elif a in ("-h", "--help"):
             out(usage())
             return 0
@@ -1200,33 +1357,48 @@ def main(argv):
         else:
             break
         i += 1
-    if i >= len(argv):
+    if i >= len(argv) and not o.list:
         out(usage())
         return 2
-    cmd, args = argv[i], argv[i + 1:]
+    if o.list and i < len(argv):
+        die(f"-l lists the repos; it doesn't run a git command (drop -l to run '{argv[i]}')")
+    cmd, args = (argv[i], argv[i + 1:]) if i < len(argv) else (None, [])
     args, yes = strip_yes(args)
     o.yes |= yes
-    cmd, args, kind, o.alias_chain = resolve_alias(cmd, args, o.start)
-    before_dashdash = args[:args.index("--")] if "--" in args else args
-    if cmd in ("help", "version") or args == ["-h"] or "--help" in before_dashdash:
-        if cmd == "help" and not args:
-            out(usage())
-            return 0
-        return subprocess.call(["git", *USER_OPTS, cmd, *args], cwd=o.start)  # once, not per repo
-    words = [a for a in args if not a.startswith("-")]
-    once = (cmd == "clone" and words) or (cmd == "init" and words) or cmd.startswith("credential") or \
-        (cmd == "config" and any(a in ("--global", "--system", "-f", "--file") or a.startswith("--file=")
-                                 for a in args))
-    if cmd == "init" and not words:
-        die(f"init creates a new repo; give its folder: {PROG} init <folder>")
-    if once:
-        return subprocess.call(["git", *USER_OPTS, cmd, *args], cwd=o.start)
+
+    if cmd:
+        cmd, args, kind, o.alias_chain = resolve_alias(cmd, args, o.start)
+        before_dashdash = args[:args.index("--")] if "--" in args else args
+        if cmd in ("help", "version") or args == ["-h"] or "--help" in before_dashdash:
+            if cmd == "help" and not args:
+                out(usage())
+                return 0
+            return subprocess.call(["git", *USER_OPTS, cmd, *args], cwd=o.start)  # once, not per repo
+        words = [a for a in args if not a.startswith("-")]
+        once = (cmd == "clone" and words) or (cmd == "init" and words) or cmd.startswith("credential") or \
+            (cmd == "config" and any(a in ("--global", "--system", "-f", "--file") or a.startswith("--file=")
+                                     for a in args))
+        if cmd == "init" and not words:
+            die(f"init creates a new repo; give its folder: {PROG} init <folder>")
+        if once:
+            return subprocess.call(["git", *USER_OPTS, cmd, *args], cwd=o.start)
+    else:
+        kind = None
 
     ws = find_workspace(o.start)
+    for w in ws.warnings:
+        err(YELLOW(f"{PROG}: {w}"))
     if not ws.repos:
         die(f"no git repos found in {ws.root} (run it in or inside the folder that contains "
             f"your repos, or list them in a {CONFIG} file)")
-    run = Run(ws, select(ws, o.picks), o, [cmd, *args])
+    repos = select(ws, o.picks, o.drops)
+    if o.list:
+        return list_repos(ws, repos, bool(o.picks or o.drops))
+    if not repos:
+        out("no repo matches " + " ".join([*(f"-r {quote(p)}" for p in o.picks),
+                                            *(f"-x {quote(d)}" for d in o.drops)]))
+        return 0
+    run = Run(ws, repos, o, [cmd, *args])
     if kind == "shell":
         return run.passthrough(cmd, args, alias="shell")
     handler = {"status": run.status, "commit": run.commit, "push": run.push,

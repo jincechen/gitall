@@ -22,29 +22,64 @@ gitall stash list                  # ...any other git command works too
 
 - By default: every git repo directly inside the current folder; or, when you run it
   from inside a repo (any subfolder), that repo and its sibling repos.
-- To fix the list (or its order), put a `.gitall` file in that folder, one repo per line.
-  Globs and `#` comments are allowed:
+- To fix the list (or its order), put a `.gitall` file in that folder. `gitall` looks for
+  it in the current folder and its parents, so it also works from inside one of the repos.
   ```
   # .gitall
-  Project1
-  Notes_*
+  Deck*                    # globs are case-sensitive
+  !Deck-old                # leave matching repos out
+  archive/*                # paths and path globs reach deeper repos
+  [tools]                  # a group: the lines below also belong to "tools"
+  scripts
+  []                       # ends the group
   ```
-  `gitall` looks for `.gitall` in the current folder and its parents, so it also works from
-  inside one of the repos. Run `gitall -l` to see which repos it picked.
+- `gitall -l` lists the repos it picked, with their numbers and state.
+  Linked worktrees of repos in the list are left out (list them in `.gitall` to include them).
 
-## Options
+## Choosing repos for one command
 
 Put these **before** the git command.
 
 | Option | Meaning |
 |---|---|
-| `-r NAME` | Only repos whose folder name contains `NAME` (case-insensitive). Repeatable: `-r intro -r 8` |
-| `-r N` | Only the N-th repo in the list |
-| `-l` | List the repos with their numbers |
-| `-C DIR` | Start in `DIR` instead of the current folder |
+| `-r NAME` | The repo with that name, else repos whose name contains `NAME` (any case) |
+| `-r 'Deck*'` | A glob |
+| `-r 3`, `-r 2-5` | Positions in the list (see `gitall -l`) |
+| `-r tools` | A `[tools]` group from `.gitall` |
+| `-r :dirty` | Repos in a state (below) |
+| `-r a,b,c` | Several at once; `-r` can also be repeated |
+| `-x NAME` / `-r '!NAME'` | Leave repos out (names, globs, groups or states) |
+
+Names, globs and groups add up. States keep the repos that are in any of them, so
+`gitall -r tools -r :dirty,:ahead -l` shows the tools repos that have changes or unpushed commits.
+
+| State | Repos that... |
+|---|---|
+| `:dirty` / `:clean` | have / don't have uncommitted changes (incl. untracked files) |
+| `:staged`, `:modified`, `:untracked` | have staged, unstaged or untracked changes |
+| `:ahead`, `:behind`, `:diverged` | have unpushed commits, commits to pull, or both |
+| `:noupstream` | have no upstream branch (or it is gone) |
+| `:stash` | have stashed changes |
+| `:merging` | are in the middle of a merge, rebase, cherry-pick or revert |
+| `:detached` | are on a detached HEAD |
+| `:on=BRANCH` | are on that branch (globs allowed: `:on=feature/*`) |
+| `:has=BRANCH` | have that branch, locally or on a remote |
+
+```
+gitall -x Drafts pull                          # everything except Drafts
+gitall -r :ahead push
+gitall -r :has=feature/x switch feature/x
+gitall -r tools -l                             # check a choice before using it
+```
+
+## Other options
+
+| Option | Meaning |
+|---|---|
 | `-y` | Don't ask for confirmation (also allowed as the last argument) |
 | `-q` | Leave out repos with nothing to report |
 | `--prefix` | Start each output line with the repo's path: `gitall --prefix grep -n TODO` |
+| `-C DIR` | Start in `DIR` instead of the current folder |
 | `-c name=value`, `--no-pager`, `--literal-pathspecs`, ... | git's own options, passed on to git |
 | `-h` | Help |
 

@@ -1,15 +1,18 @@
 """Which repos gitall picks: .gitall file, repos in the folder, or the repo and its siblings."""
+import re
+
 from conftest import write
+
+
+def listed(result):
+    """Repo names from `gitall -l` output, in order."""
+    lines = result.out.splitlines()[1:]  # the first line is "N repo(s) in ..."
+    return [m.group(1) for m in (re.match(r"\s*\d+\s+(\S+)", ln) for ln in lines) if m]
 
 
 def rows(result):
     """The repo names at the start of compact one-line-per-repo output."""
     return [line.split()[0] for line in result.out.splitlines() if line.strip()]
-
-
-def listed(result):
-    """Repo names from `gitall -l` output, in order."""
-    return [line.split(None, 1)[1] for line in result.out.splitlines()[1:]]
 
 
 def test_repos_in_folder_sorted_naturally(world, run):
@@ -19,6 +22,14 @@ def test_repos_in_folder_sorted_naturally(world, run):
     assert r.code == 0
     assert listed(r) == ["deck1", "Deck2", "Deck10"]
     assert r.out.startswith(f"3 repo(s) in {world.work}")
+
+
+def test_list_rows_show_position_branch_and_state(world, run):
+    world.repo("A", remote=False)
+    world.repo("Bee")
+    r = run("-l", cwd=world.work)
+    assert "  1  A    main  local only" in r.out
+    assert "  2  Bee  main  clean" in r.out
 
 
 def test_folders_and_files_that_are_not_repos_are_ignored(world, run):
@@ -74,13 +85,16 @@ def test_gitall_file_in_a_parent_is_found_from_inside_a_repo(world, run):
     assert listed(run("-l", cwd=sub)) == ["A", "B"]
 
 
-def test_gitall_file_entry_that_is_not_a_repo(world, run):
+def test_gitall_file_entry_that_is_not_a_repo_is_left_out_with_a_warning(world, run):
     world.repo("A", remote=False)
     (world.work / "plain").mkdir()
     write(world.work / ".gitall", "A\n\nplain\n")
-    r = run("status", cwd=world.work)
-    assert r.code == 2
-    assert "line 3: 'plain' is not a git repo" in r.err
+    r = run("-l", cwd=world.work)
+    assert r.code == 0
+    assert "line 3: 'plain' is not a git repo, left out" in r.err
+    assert listed(r) == ["A"]
+    r = run("status", cwd=world.work)  # commands still run in the others
+    assert r.code == 0 and "A  main  local only" in r.out
 
 
 def test_gitall_file_glob_matching_nothing(world, run):
@@ -89,6 +103,7 @@ def test_gitall_file_glob_matching_nothing(world, run):
     r = run("-l", cwd=world.work)
     assert r.code == 2
     assert "'Missing*' is not a git repo" in r.err
+    assert "no git repos found" in r.err
 
 
 def test_gitall_file_repo_matched_twice_is_listed_once(world, run):
@@ -120,8 +135,7 @@ def test_select_by_name_substring_ignoring_case(world, run):
     for name in ("Deck1_Intro", "Deck2_Methods", "Deck3_Results"):
         world.repo(name, remote=False)
     r = run("-r", "methods", "rev-parse", "--show-toplevel", cwd=world.work)
-    assert "Deck2_Methods" in r.out
-    assert "Deck1" not in r.out and "Deck3" not in r.out
+    assert rows(r) == ["Deck2_Methods"]
 
 
 def test_select_by_position(world, run):
