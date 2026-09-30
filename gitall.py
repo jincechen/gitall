@@ -23,6 +23,7 @@ Choosing repos (these options go before the git command):
                         name      the repo's name, else part of a name (any case)
                         glob      e.g. 'Deck*'
                         N, N-M    positions in the list (see -l)
+                        group     a [group] from .gitall
                         :state    dirty clean staged modified untracked ahead behind
                                   diverged noupstream stash merging detached
                                   on=BRANCH has=BRANCH
@@ -41,10 +42,11 @@ Other options:
                       git's own options are passed on to git
   -h, --help          show this help
 
-Which repos: the folders listed in a .gitall file (in the current directory or the
-nearest parent that has one); else every git repo directly inside the current
-directory; else, when run inside a repo, that repo and its sibling repos.
-`gitall -l` shows which repos it picked.
+Which repos: those listed in the nearest .gitall file (in the current directory or a
+parent); else every git repo directly inside the current directory; else, inside a
+repo, that repo and its siblings. A .gitall file has one entry per line: a name, a
+path or a glob ('Deck*', 'archive/*'); '!entry' leaves repos out; '[name]' starts a
+group and '[]' ends it; # starts a comment.
 """
 import errno
 import fnmatch
@@ -288,6 +290,14 @@ def git_dir(path):
     return None
 
 
+def worktree_of(path):
+    """The main repo's folder if path is a linked worktree, else None."""
+    if not (path / ".git").is_file():
+        return None
+    d = git_dir(path)
+    return d.parent.parent.parent if d and d.parent.name == "worktrees" else None
+
+
 def subdirs(d):
     try:
         return sorted((p for p in d.iterdir() if p.is_dir()), key=lambda p: natural(p.name))
@@ -440,7 +450,7 @@ class Repo:
 class Workspace:
     def __init__(self, root, config=None):
         self.root, self.config = root, config
-        self.repos, self.groups = [], {}
+        self.repos, self.groups, self.hidden, self.warnings = [], {}, [], []
 
 
 def find_workspace(start):
@@ -458,27 +468,62 @@ def find_workspace(start):
         if top:
             ws.root = Path(top).resolve().parent
             found = [p for p in subdirs(ws.root) if is_repo(p)]
-    ws.repos = [Repo(p, ws.root) for p in found]
+    keys, here = {key(p) for p in found}, key(start)
+    for p in found:
+        main = worktree_of(p)
+        inside = here == key(p) or here.startswith(key(p) + os.sep)
+        if main is not None and key(main) in keys and not inside:
+            ws.hidden.append(f"{p.name} (worktree of {main.name})")
+        else:
+            ws.repos.append(Repo(p, ws.root))
     return ws
+
+
+def config_entry(root, entry):
+    """The repos an entry of .gitall names: a name, a path, or globs per path part."""
+    paths = [root]
+    for part in entry.split("/"):
+        if any(ch in part for ch in GLOB_CHARS):
+            paths = [c for d in paths for c in subdirs(d) if fnmatch.fnmatchcase(c.name, part)
+                     and (part.startswith(".") or not c.name.startswith("."))]
+        else:
+            paths = [d / part for d in paths]
+    return [p for p in paths if is_repo(p)]
 
 
 def read_config(root, cfg):
     ws = Workspace(root, cfg)
-    known = {}
-    for n, raw in enumerate(cfg.read_text(encoding="utf-8").splitlines(), 1):
-        entry = raw.split("#", 1)[0].strip().rstrip("/\\")
-        if not entry:
+    known, excluded, group = {}, set(), None
+    for n, raw in enumerate(cfg.read_text(encoding="utf-8-sig").splitlines(), 1):
+        line = re.sub(r"(^|\s)#.*", "", raw).strip()    # '#' starts a comment, 'C#' doesn't
+        if not line:
             continue
-        if any(ch in entry for ch in "*?["):
-            hits = [p for p in subdirs(root) if fnmatch.fnmatchcase(p.name, entry) and is_repo(p)]
-        else:
-            hits = [root / entry] if is_repo(root / entry) else []
+        m = re.fullmatch(r"\[\s*(.*?)\s*\]", line)
+        if m:
+            group = m.group(1) or None                    # [] ends the group
+            if group:
+                ws.groups.setdefault(group.lower(), (group, []))
+            continue
+        exclude = line.startswith("!")
+        entry = line.lstrip("!").strip()
+        entry = entry.replace("\\", "/").rstrip("/")
+        hits = config_entry(root, entry)
+        if exclude:
+            excluded |= {key(p) for p in hits}
+            continue
         if not hits:
-            die(f"{cfg}, line {n}: '{entry}' is not a git repo")
+            ws.warnings.append(f"{cfg}, line {n}: '{entry}' is not a git repo, left out")
+            continue
         for p in hits:
-            if key(p) not in known:
-                known[key(p)] = Repo(p, root)
-                ws.repos.append(known[key(p)])
+            r = known.get(key(p))
+            if r is None:
+                r = known[key(p)] = Repo(p, root)
+                ws.repos.append(r)
+            if group and r not in ws.groups[group.lower()][1]:
+                ws.groups[group.lower()][1].append(r)
+    ws.repos = [r for r in ws.repos if key(r.path) not in excluded]
+    for g, (name, members) in ws.groups.items():
+        ws.groups[g] = (name, [r for r in members if key(r.path) not in excluded])
     return ws
 
 
@@ -1246,6 +1291,8 @@ def list_repos(ws, chosen, picked):
             out(f"{ws.repos.index(r) + 1:3}  {repo_row(r, width, bwidth)}")
     if ws.groups:
         out("groups: " + ", ".join(f"{name} ({len(rs)})" for name, rs in ws.groups.values()))
+    if ws.hidden:
+        out("left out: " + ", ".join(ws.hidden))
     return 0
 
 
@@ -1339,6 +1386,8 @@ def main(argv):
         kind = None
 
     ws = find_workspace(o.start)
+    for w in ws.warnings:
+        err(YELLOW(f"{PROG}: {w}"))
     if not ws.repos:
         die(f"no git repos found in {ws.root} (run it in or inside the folder that contains "
             f"your repos, or list them in a {CONFIG} file)")

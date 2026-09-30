@@ -80,6 +80,24 @@ def test_more_read_only_forms(cmd, args):
     assert read_only(cmd, args)
 
 
+def test_gitall_file_hash_and_dot_git_in_names(world, run):
+    world.repo("C# tools", remote=False)
+    world.repo("my repo.git", remote=False)
+    write(world.work / ".gitall", "C# tools   # a comment\nmy repo.git\n")
+    r = run("-l", cwd=world.work)
+    assert "C# tools" in r.out and "my repo.git" in r.out
+    assert "missing" not in r.out and not r.err
+
+
+def test_gitall_file_empty_brackets_end_a_group(world, run):
+    for name in ("A", "B", "C"):
+        world.repo(name, remote=False)
+    write(world.work / ".gitall", "[g]\nA\n[]\nB\n")
+    r = run("-r", "g", "-l", cwd=world.work)
+    assert r.out.startswith("1 of 2 repo(s)")
+    assert "groups: g (1)" in r.out
+
+
 def test_quiet_status_says_when_all_is_clean(world, run):
     world.repo("A")
     world.repo("B")

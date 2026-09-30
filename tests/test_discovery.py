@@ -85,13 +85,16 @@ def test_gitall_file_in_a_parent_is_found_from_inside_a_repo(world, run):
     assert listed(run("-l", cwd=sub)) == ["A", "B"]
 
 
-def test_gitall_file_entry_that_is_not_a_repo(world, run):
+def test_gitall_file_entry_that_is_not_a_repo_is_left_out_with_a_warning(world, run):
     world.repo("A", remote=False)
     (world.work / "plain").mkdir()
     write(world.work / ".gitall", "A\n\nplain\n")
-    r = run("status", cwd=world.work)
-    assert r.code == 2
-    assert "line 3: 'plain' is not a git repo" in r.err
+    r = run("-l", cwd=world.work)
+    assert r.code == 0
+    assert "line 3: 'plain' is not a git repo, left out" in r.err
+    assert listed(r) == ["A"]
+    r = run("status", cwd=world.work)  # commands still run in the others
+    assert r.code == 0 and "A  main  local only" in r.out
 
 
 def test_gitall_file_glob_matching_nothing(world, run):
@@ -100,6 +103,7 @@ def test_gitall_file_glob_matching_nothing(world, run):
     r = run("-l", cwd=world.work)
     assert r.code == 2
     assert "'Missing*' is not a git repo" in r.err
+    assert "no git repos found" in r.err
 
 
 def test_gitall_file_repo_matched_twice_is_listed_once(world, run):
