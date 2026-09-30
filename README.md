@@ -22,15 +22,19 @@ gitall stash list                  # ...any other git command works too
 
 - By default: every git repo directly inside the current folder; or, when you run it
   from inside a repo (any subfolder), that repo and its sibling repos.
-- To fix the list (or its order), put a `.gitall` file in that folder, one repo per line.
-  Globs and `#` comments are allowed:
+- To fix the list (or its order), put a `.gitall` file in that folder. `gitall` looks for
+  it in the current folder and its parents, so it also works from inside one of the repos.
   ```
   # .gitall
-  Project1
-  Notes_*
+  Deck*                    # globs are case-sensitive
+  !Deck-old                # leave matching repos out
+  archive/*                # paths and path globs reach deeper repos
+  [tools]                  # a group: the lines below also belong to "tools"
+  scripts
+  []                       # ends the group
   ```
-  `gitall` looks for `.gitall` in the current folder and its parents, so it also works from
-  inside one of the repos. Run `gitall -l` to see which repos it picked.
+- `gitall -l` lists the repos it picked, with their numbers and state.
+  Linked worktrees of repos in the list are left out (list them in `.gitall` to include them).
 
 ## Choosing repos for one command
 
@@ -41,6 +45,7 @@ Put these **before** the git command.
 | `-r NAME` | The repo with that name, else repos whose name contains `NAME` (any case) |
 | `-r 'Deck*'` | A glob |
 | `-r 3`, `-r 2-5` | Positions in the list (see `gitall -l`) |
+| `-r tools` | A `[tools]` group from `.gitall` |
 | `-r :dirty` | Repos in a state (below) |
 | `-r a,b,c` | Several at once; `-r` can also be repeated |
 | `-x NAME` / `-r '!NAME'` | Leave repos out (names, globs, groups or states) |
