@@ -14,9 +14,13 @@ gitall add -A
 gitall commit -m "Fix typos"       # shows what each repo will commit, asks once, commits
 gitall push                        # pushes repos that have unpushed commits, asks first
 gitall pull
+gitall switch {default}            # main in some repos, master in others
 gitall log -3 --oneline
 gitall stash list                  # ...any other git command works too
 ```
+
+Everything from the git command onwards goes to git unchanged. gitall's own options
+go before the git command.
 
 ## Which repos
 
@@ -82,6 +86,25 @@ gitall -r tools -l                             # check a choice before using it
 | `-C DIR` | Start in `DIR` instead of the current folder |
 | `-c name=value`, `--no-pager`, `--literal-pathspecs`, ... | git's own options, passed on to git |
 | `-h` | Help |
+
+## Per-repo values
+
+In the arguments, `{repo}`, `{path}`, `{branch}`, `{upstream}` and `{default}` become each
+repo's folder name, path, current branch, upstream branch and default branch (main, master,
+...). The confirmation shows the command for each repo.
+
+```
+gitall switch {default}
+gitall tag {repo}-v1.0
+gitall commit -am "Weekly edits ({repo})"
+```
+
+In PowerShell, quote them: `'{repo}'`. Repos where a value doesn't exist (no upstream,
+detached HEAD) are skipped with the reason shown. git's `@{upstream}` is left alone.
+
+git commands run with `GITALL_REPO`, `GITALL_PATH`, `GITALL_I` and `GITALL_COUNT` set, so your
+own aliases can use them. A shell alias also runs in each repo (after a confirmation), which
+covers non-git commands: `git config --global alias.make '!make'`, then `gitall make`.
 
 ## What's different from plain git
 

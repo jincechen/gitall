@@ -46,6 +46,13 @@ def test_repo_placeholder_in_message(world, run):
     assert last_message(b) == "Weekly edits (Deck2)"
 
 
+def test_preview_shows_the_expanded_message(world, run):
+    world.repo("Deck1")
+    write(world.work / "Deck1" / "main.tex", "changed\n")
+    r = run("commit", "-am", "Edits ({repo})", "--dry-run", cwd=world.work)
+    assert "   message: Edits (Deck1)" in r.out
+
+
 def test_dry_run_only_previews(world, run):
     a, _ = two_repos_one_staged(world)
     before = world.head("A")

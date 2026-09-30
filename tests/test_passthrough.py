@@ -207,12 +207,15 @@ def test_grep_ignore_case_and_pattern_are_captured(world, run):
     assert shown_repos(run("grep", "-e", "Hello", cwd=world.work)) == ["A"]
 
 
+# ---- paths and files ------------------------------------------------------------------------------
 def test_relative_output_file_is_written_where_you_are(world, run):
     world.repo("A")
-    r = run("-y", "archive", "-o", "out.zip", "HEAD", cwd=world.work)
+    world.repo("B")
+    r = run("-y", "archive", "-o", "out-{repo}.zip", "HEAD", cwd=world.work)
     assert r.code == 0, r
-    assert zipfile.ZipFile(world.work / "out.zip").namelist() == ["main.tex"]
-    assert not (world.work / "A" / "out.zip").exists()
+    for name in ("A", "B"):
+        assert zipfile.ZipFile(world.work / f"out-{name}.zip").namelist() == ["main.tex"]
+        assert not (world.work / name / f"out-{name}.zip").exists()
 
 
 def test_checkout_of_a_file_is_not_skipped_in_a_repo_mid_merge(world, run):
