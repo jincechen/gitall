@@ -28,7 +28,7 @@ def test_unknown_option(world, run):
 def test_option_missing_its_value(world, run):
     r = run("status", "-r", cwd=world.work)  # after the command: goes to git, not to gitall
     assert "needs a value" not in r.err
-    for opt in ("-r", "-C", "-c"):
+    for opt in ("-r", "-x", "-C"):
         r = run(opt, cwd=world.work)
         assert r.code == 2 and f"{opt} needs a value" in r.err
 
@@ -40,6 +40,23 @@ def test_git_version_runs_once(world, run):
     assert r.code == 0 and r.out.count("git version") == 1
     r = run("--version", cwd=world.work)
     assert r.code == 0 and r.out.count("git version") == 1
+
+
+def test_list_with_a_command_is_an_error(world, run):
+    world.repo("A", remote=False)
+    r = run("-l", "status", cwd=world.work)
+    assert r.code == 2
+    assert "-l lists the repos" in r.err
+
+
+def test_list_respects_selection(world, run):
+    for name in ("A", "B", "C"):
+        world.repo(name, remote=False)
+    r = run("-r", "B", "-l", cwd=world.work)
+    assert r.out.startswith("1 of 3 repo(s)")
+    assert "  2  B  main  local only" in r.out
+    r = run("-l", "-x", "B", cwd=world.work)  # option order doesn't matter
+    assert r.out.startswith("2 of 3 repo(s)")
 
 
 def test_yes_after_the_git_command(world, run):
@@ -125,7 +142,7 @@ def test_renaming_the_script_renames_messages_and_config(world, run_script, tmp_
     script.parent.mkdir()
     shutil.copy(ROOT / "gitall.py", script)
     r = run_script("-l", cwd=world.work, script=script)
-    assert "(from .multigit)" in r.out and r.out.rstrip().endswith("B")
+    assert "(from .multigit)" in r.out and "  1  B  main  local only" in r.out
     r = run_script("-h", cwd=world.work, script=script)
     assert "Usage:  multigit" in r.out and ".multigit file" in r.out and "gitall" not in r.out
     r = run_script("-r", "zzz", "status", cwd=world.work, script=script)

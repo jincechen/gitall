@@ -1,15 +1,18 @@
 """Which repos gitall picks: .gitall file, repos in the folder, or the repo and its siblings."""
+import re
+
 from conftest import write
+
+
+def listed(result):
+    """Repo names from `gitall -l` output, in order."""
+    lines = result.out.splitlines()[1:]  # the first line is "N repo(s) in ..."
+    return [m.group(1) for m in (re.match(r"\s*\d+\s+(\S+)", ln) for ln in lines) if m]
 
 
 def rows(result):
     """The repo names at the start of compact one-line-per-repo output."""
     return [line.split()[0] for line in result.out.splitlines() if line.strip()]
-
-
-def listed(result):
-    """Repo names from `gitall -l` output, in order."""
-    return [line.split(None, 1)[1] for line in result.out.splitlines()[1:]]
 
 
 def test_repos_in_folder_sorted_naturally(world, run):
@@ -19,6 +22,14 @@ def test_repos_in_folder_sorted_naturally(world, run):
     assert r.code == 0
     assert listed(r) == ["deck1", "Deck2", "Deck10"]
     assert r.out.startswith(f"3 repo(s) in {world.work}")
+
+
+def test_list_rows_show_position_branch_and_state(world, run):
+    world.repo("A", remote=False)
+    world.repo("Bee")
+    r = run("-l", cwd=world.work)
+    assert "  1  A    main  local only" in r.out
+    assert "  2  Bee  main  clean" in r.out
 
 
 def test_folders_and_files_that_are_not_repos_are_ignored(world, run):
@@ -120,8 +131,7 @@ def test_select_by_name_substring_ignoring_case(world, run):
     for name in ("Deck1_Intro", "Deck2_Methods", "Deck3_Results"):
         world.repo(name, remote=False)
     r = run("-r", "methods", "rev-parse", "--show-toplevel", cwd=world.work)
-    assert "Deck2_Methods" in r.out
-    assert "Deck1" not in r.out and "Deck3" not in r.out
+    assert rows(r) == ["Deck2_Methods"]
 
 
 def test_select_by_position(world, run):
