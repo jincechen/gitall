@@ -34,6 +34,19 @@ def test_push_with_arguments_does_not_crash(world, run):
     assert world.remote_head("A") == world.head("A")
 
 
+def test_one_message_with_a_placeholder_some_repo_lacks(world, run, monkeypatch):
+    monkeypatch.setenv("GIT_EDITOR", "echo 'msg {upstream}' >")
+    a = world.repo("A")
+    b = world.repo("B", remote=False)
+    for repo in (a, b):
+        write(repo / "main.tex", "changed\n")
+    r = run("commit", "-a", "-y", cwd=world.work)
+    assert r.code == 0, r
+    assert git(a, "log", "-1", "--format=%s") == "msg origin/main"
+    assert "B: no upstream branch, so no {upstream}" in r.out
+    assert git(b, "log", "-1", "--format=%s") == "initial"
+
+
 def test_broken_repo_is_a_failure_not_a_skip(world, run):
     world.repo("A")
     broken = world.work / "B"
