@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-from gitall import absolutize, commit_opens_editor, interactive, read_only, strip_yes
+from gitall import absolutize, branch_plan, commit_opens_editor, interactive, read_only, strip_yes
 
 
 @pytest.mark.parametrize("cmd, args, expected", [
@@ -178,6 +178,29 @@ def test_commit_opens_editor(args, expected):
 ])
 def test_strip_yes(args, expected):
     assert strip_yes(args) == expected
+
+
+@pytest.mark.parametrize("cmd, args, expected", [
+    ("switch", ["feature"], ("switch", "feature")),
+    ("checkout", ["feature"], ("switch", "feature")),
+    ("switch", ["-q", "feature"], ("switch", "feature")),
+    ("switch", ["{default}"], ("switch", "{default}")),
+    ("switch", ["-c", "new"], ("create", "new", False)),
+    ("switch", ["--create=new"], ("create", "new", False)),
+    ("switch", ["-C", "new", "origin/x"], ("create", "new", True)),
+    ("checkout", ["-b", "new"], ("create", "new", False)),
+    ("checkout", ["-B", "new", "HEAD~1"], ("create", "new", True)),
+    ("switch", ["-"], None),
+    ("switch", ["--detach", "v1"], None),
+    ("checkout", ["--", "main.tex"], None),
+    ("checkout", ["HEAD", "--", "main.tex"], None),
+    ("checkout", ["-p"], None),
+    ("checkout", ["a", "b"], None),
+    ("switch", ["-c"], None),
+    ("switch", ["--orphan", "x"], None),
+])
+def test_branch_plan(cmd, args, expected):
+    assert branch_plan(cmd, args) == expected
 
 
 def test_absolutize_makes_file_options_relative_to_the_start():

@@ -15,6 +15,8 @@ arguments mean what they mean in git. A few commands get extra help:
   push            only repos with unpushed commits; previews them and asks once
   pull            one line per repo: fast-forward, merged, up to date or CONFLICT
   fetch           one line per repo: what came in, then ahead/behind
+  switch/checkout <branch>
+                  previews which repos have the branch, asks once; the others are skipped
   anything else   runs in every repo; repos with no output are left out; commands
                   that change things show what will run and ask first
 
@@ -379,7 +381,7 @@ class State:
         """Has an upstream branch that exists (as of the last fetch)."""
         return bool(self.upstream) and not self.gone
 
-    def problem(self):
+    def problem(self, detached_ok=False):
         """Why it isn't safe to commit/pull/push here right now, or None."""
         if self.error:
             return self.error
@@ -388,7 +390,7 @@ class State:
                     f"{self.gitdir / 'index.lock'})")
         if self.op:
             return OP_HELP[self.op]
-        if self.detached:
+        if self.detached and not detached_ok:
             return "detached HEAD (git switch <branch>)"
         return None
 
@@ -420,6 +422,9 @@ class State:
     def has_branch(self, pattern):
         local, remote, _ = self.refs()
         return any(fnmatch.fnmatchcase(b, pattern) for b in local.union(*remote.values()))
+
+    def remotes_with(self, branch):
+        return [rem for rem, bs in self.refs()[1].items() if branch in bs]
 
     def default_branch(self):
         local, remote, heads = self.refs()
@@ -853,6 +858,37 @@ def resolve_alias(cmd, args, cwd):
     return cmd, args, "git", chain
 
 
+def branch_plan(cmd, args):
+    """('switch', branch) or ('create', branch, force) for a plain branch switch, else None."""
+    if "--" in args or interactive(cmd, args):
+        return None
+    create_opts = {"switch": ("-c", "--create", "-C", "--force-create"), "checkout": ("-b", "-B")}[cmd]
+    safe = {"-q", "--quiet", "-f", "--force", "--discard-changes", "-m", "--merge", "--guess",
+            "--no-guess", "--ignore-other-worktrees", "--progress", "--no-progress"}
+    words, create, force, i = [], None, False, 0
+    while i < len(args):
+        a = args[i]
+        if a in create_opts:
+            if i + 1 >= len(args):
+                return None
+            create, force = args[i + 1], a in ("-C", "--force-create", "-B")
+            i += 2
+            continue
+        if cmd == "switch" and a.startswith(("--create=", "--force-create=")):
+            create, force = a.split("=", 1)[1], a.startswith("--force")
+        elif a.startswith("-"):
+            if a not in safe:
+                return None
+        else:
+            words.append(a)
+        i += 1
+    if create is not None:
+        return ("create", create, force) if len(words) <= 1 else None
+    if len(words) == 1 and words[0] != "-":
+        return ("switch", words[0])
+    return None
+
+
 # ---- commands --------------------------------------------------------------------------
 class Blocks:
     """Each repo's output under a header. While every repo prints just one line, the lines
@@ -999,11 +1035,11 @@ class Run:
                     GITALL_ROOT=str(self.ws.root), GITALL_COUNT=str(len(self.repos)),
                     GITALL_I=str(self.repos.index(repo) + 1 if repo in self.repos else 0))
 
-    def plan(self, args, check=True):
+    def plan(self, args, detached_ok=False, check=True):
         """[(repo, args for it)] for the repos that are safe to change; skips the others."""
         res = []
         for r in self.repos:
-            prob = r.state.problem() if check else None
+            prob = r.state.problem(detached_ok) if check else None
             if prob and r.state.error:
                 self.fail(r, prob, False)      # not a repo git can read
                 continue
@@ -1262,6 +1298,65 @@ class Run:
             self.count("fetched" if got else "nothing new", r)
         self.finish("fetch")
 
+    # -- switch / checkout <branch>
+    def switch(self, cmd, args):
+        if branch_plan(cmd, args) is None:
+            return self.passthrough(cmd, args)
+        plans = {r: (rargs, branch_plan(cmd, rargs)) for r, rargs in self.plan(args, detached_ok=True)}
+        if not plans:
+            self.finish()
+        groups, todo = {}, []
+        for r, (rargs, p) in plans.items():
+            s, branch = r.state, p[1]
+            local, _, _ = s.refs()
+            if p[0] == "create":
+                kind = "create" if p[2] or branch not in local else None
+                if kind is None:
+                    self.skip(r, f"already has a branch '{branch}'")
+                    continue
+            elif s.branch == branch:
+                kind = "already on it"
+            elif branch in local:
+                kind = "switch"
+            elif s.remotes_with(branch):
+                kind = f"new branch tracking {s.remotes_with(branch)[0]}/{branch}"
+            else:
+                kind = None
+            groups.setdefault(kind, []).append(r)
+            if kind and kind != "already on it":
+                todo.append((r, rargs))
+        if p[0] == "switch" and None in groups and len(groups) == 1:
+            self.skipped = []
+            return self.passthrough(cmd, args)  # no repo has such a branch: a tag, a commit, a path
+        target = branch_plan(cmd, args)[1]
+        out(f"{'create' if p[0] == 'create' else 'switch to'} {target}:")
+        order = ["create", "switch"] + sorted(k for k in groups if k and k.startswith("new")) + ["already on it", None]
+        for kind, rs in sorted(groups.items(), key=lambda kv: order.index(kv[0])):
+            names = " ".join(r.name + ("*" if r.state.dirty else "") for r in rs)
+            label = kind or "no such branch, skipped"
+            out(f"  {label + ':':<33} {names}")
+        for r in groups.get(None, []):
+            self.skip(r, f"no branch '{plans[r][1][1]}'")
+        if any(r.state.dirty for r, _ in todo):
+            out("  (* has uncommitted changes: git takes them along, or refuses if they'd be lost)")
+        if not todo:
+            out("nothing to do")
+            self.finish()
+        confirm(f"{'Create the branch in' if p[0] == 'create' else 'Switch'} {plural(len(todo), 'repo')}?",
+                self.o.yes)
+        out()
+        for r, rargs in todo:
+            res = git(r.path, cmd, *rargs, env=self.env(r))
+            if res.rc == 0:
+                r.refresh()
+                out(f"{r.name:<{self.width}}  {GREEN('on')} {r.state.branch or branch_text(r.state)}")
+                self.count("switched", r)
+            else:
+                header(r.name)
+                err("\n".join(t for t in (res.out, res.err) if t))
+                self.fail(r, first_error(res))
+        self.finish(cmd)
+
     # -- everything else
     def passthrough(self, cmd, args, alias=None):
         live = interactive(cmd, args)
@@ -1465,6 +1560,8 @@ def main(argv):
     run = Run(ws, repos, o, [cmd, *args])
     if kind == "shell":
         return run.passthrough(cmd, args, alias="shell")
+    if cmd in ("switch", "checkout") and not interactive(cmd, args):
+        return run.switch(cmd, args)
     handler = {"status": run.status, "commit": run.commit, "push": run.push,
                "pull": run.pull, "fetch": run.fetch}.get(cmd)
     if handler:
