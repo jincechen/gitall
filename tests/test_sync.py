@@ -1,6 +1,7 @@
 """push, pull and fetch against the bare remotes standing in for Overleaf."""
 import re
 
+
 from conftest import git, write
 from helpers import make_problem
 
@@ -103,6 +104,15 @@ def test_push_tags_goes_to_every_repo(world, run):
     assert "in: A B" in r.out
     assert "A: pushed v1 [new tag]" in r.out and "B: up to date" in r.out
     assert git(world.remotes / "A.git", "tag") == "v1"
+
+
+def test_push_with_placeholder_shows_each_command(world, run):
+    world.repo("A")
+    world.repo("B")
+    r = run("push", "origin", "main:{repo}-copy", "-y", cwd=world.work)
+    assert r.code == 0, r
+    assert "Will run:\n  A: git push origin main:A-copy\n  B: git push origin main:B-copy" in r.out
+    assert git(world.remotes / "B.git", "branch", "--list", "B-copy").strip() == "B-copy"
 
 
 def test_rejected_push_suggests_pull_and_others_still_push(world, run):
@@ -237,6 +247,8 @@ def test_pull_skips_unsafe_repo(world, run):
     r = run("pull", cwd=world.work)
     assert "Skipped:\n  A: index.lock exists" in r.out
     assert world.head("A") == before
+
+
 def test_quiet_pull_leaves_out_up_to_date_repos(world, run):
     world.repo("A")
     world.repo("B")

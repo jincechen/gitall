@@ -8,13 +8,13 @@ arguments mean what they mean in git. A few commands get extra help:
 
   status          one line per repo (branch, ahead/behind, changes), then the changed
                   files; give any status option (e.g. -s) for plain git status
-  commit          previews what each repo would commit, asks once, then commits;
-                  repos with nothing to commit are skipped; {repo} in the message
-                  becomes the repo's folder name; --dry-run only previews;
-                  without -m (or with -c, -e, --squash) git opens an editor per repo
+  commit          previews each repo's commit and asks once; repos with nothing to
+                  commit are skipped; without -m you write one message for all repos
   push            only repos with unpushed commits; previews them and asks once
   pull            one line per repo: fast-forward, merged, up to date or CONFLICT
   fetch           one line per repo: what came in, then ahead/behind
+  switch/checkout <branch>
+                  previews which repos have the branch, asks once; the others are skipped
   anything else   runs in every repo; repos with no output are left out; commands
                   that change things show what will run and ask first
 
@@ -42,6 +42,10 @@ Other options:
                       git's own options are passed on to git
   -h, --help          show this help
 
+Per-repo values: {repo} {path} {branch} {upstream} {default} in the arguments become
+each repo's folder name, path, current branch, upstream and default branch (main,
+master, ...), e.g.  gitall switch {default}.  In PowerShell, quote them: '{repo}'.
+
 Which repos: those listed in the nearest .gitall file (in the current directory or a
 parent); else every git repo directly inside the current directory; else, inside a
 repo, that repo and its siblings. A .gitall file has one entry per line: a name, a
@@ -53,8 +57,10 @@ import fnmatch
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -126,6 +132,7 @@ GIT_FLAGS = {"--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "-
              "--no-optional-locks", "--no-replace-objects", "--no-lazy-fetch", "--no-advice"}
 GIT_REFUSED = ("--git-dir", "--work-tree", "--namespace", "--bare", "--exec-path", "-p", "--paginate")
 
+PLACEHOLDER = re.compile(r"(?<!@)\{(repo|path|branch|upstream|default)\}")
 GLOB_CHARS = "*?["
 STATUS_FILES = 10                       # changed files listed per repo by status
 
@@ -232,7 +239,7 @@ def _text(b):
     return b.decode("utf-8", "replace").rstrip("\n")
 
 
-def git(cwd, *args, live=False, colour=False, internal=False):
+def git(cwd, *args, live=False, colour=False, internal=False, env=None):
     """Run git in cwd -> Res(rc, out, err).
     internal: for gitall's own queries (plain, uncoloured output);
     live: attached to the terminal (editors, prompts)."""
@@ -245,8 +252,8 @@ def git(cwd, *args, live=False, colour=False, internal=False):
         cmd += USER_OPTS
     cmd += ["--no-pager", *args]
     if live:
-        return Res(subprocess.call(cmd, cwd=cwd), "", "")
-    p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return Res(subprocess.call(cmd, cwd=cwd, env=env), "", "")
+    p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return Res(p.returncode, _text(p.stdout), _text(p.stderr))
 
 
@@ -261,6 +268,30 @@ def first_error(res):
         if ln.startswith(("fatal:", "error:")):
             return ln
     return lines[0] if lines else f"git exited with {res.rc}"
+
+
+def find_sh():
+    if os.name != "nt":
+        return shutil.which("sh") or "/bin/sh"
+    found = shutil.which("sh")
+    if found:
+        return found
+    exec_path = git_ok(Path.cwd(), "--exec-path")       # <git>/mingw64/libexec/git-core
+    if exec_path:
+        top = Path(exec_path).parents[2]
+        for sh in (top / "usr" / "bin" / "sh.exe", top / "bin" / "sh.exe"):
+            if sh.exists():
+                return str(sh)
+    return None
+
+
+def run_editor(path, cwd):
+    """Open git's editor on path, the way git does. True if it exited cleanly."""
+    editor = git_ok(cwd, "var", "GIT_EDITOR") or "vi"
+    sh = find_sh()
+    if sh:
+        return subprocess.call([sh, "-c", f'{editor} "$@"', editor, path.as_posix()], cwd=cwd) == 0
+    return subprocess.call(f'{editor} "{path}"', shell=True, cwd=cwd) == 0
 
 
 # ---- repos ---------------------------------------------------------------------------
@@ -374,7 +405,7 @@ class State:
         """Has an upstream branch that exists (as of the last fetch)."""
         return bool(self.upstream) and not self.gone
 
-    def problem(self):
+    def problem(self, detached_ok=False):
         """Why it isn't safe to commit/pull/push here right now, or None."""
         if self.error:
             return self.error
@@ -383,7 +414,7 @@ class State:
                     f"{self.gitdir / 'index.lock'})")
         if self.op:
             return OP_HELP[self.op]
-        if self.detached:
+        if self.detached and not detached_ok:
             return "detached HEAD (git switch <branch>)"
         return None
 
@@ -415,6 +446,20 @@ class State:
     def has_branch(self, pattern):
         local, remote, _ = self.refs()
         return any(fnmatch.fnmatchcase(b, pattern) for b in local.union(*remote.values()))
+
+    def remotes_with(self, branch):
+        return [rem for rem, bs in self.refs()[1].items() if branch in bs]
+
+    def default_branch(self):
+        local, remote, heads = self.refs()
+        mine = self.upstream.split("/", 1)[0] if self.upstream else "origin"
+        for rem in (mine, "origin", *sorted(heads)):
+            if rem in heads:
+                return heads[rem]
+        for name in ("main", "master"):
+            if name in local or any(name in bs for bs in remote.values()):
+                return name
+        return None
 
     def fetched(self):
         """Seconds since the last fetch, or None if never."""
@@ -729,6 +774,37 @@ def commit_opens_editor(args):
     return not {"m", "message", "F", "file", "C", "reuse-message", "fixup"} & opts.keys()
 
 
+def expand(args, repo):
+    """args with {repo} {path} {branch} {upstream} {default} filled in for repo
+    (never inside @{...}, which is git's own syntax). Raises Skip if a value is missing."""
+    def value(m):
+        name = m.group(1)
+        if name == "repo":
+            return repo.folder
+        if name == "path":
+            return repo.name
+        s = repo.state
+        if s.error:
+            raise Skip(s.error)
+        if name == "branch":
+            if not s.branch:
+                raise Skip("detached HEAD, so no {branch}")
+            return s.branch
+        if name == "upstream":
+            if not s.tracking:
+                raise Skip("no upstream branch, so no {upstream}")
+            return s.upstream
+        d = s.default_branch()
+        if not d:
+            raise Skip("can't tell its default branch for {default}")
+        return d
+    return [PLACEHOLDER.sub(value, a) for a in args]
+
+
+class Skip(Exception):
+    pass
+
+
 def absolutize(cmd, args, start):
     """Make file options (commit -F msg.txt, archive -o out.zip) relative to where gitall
     was started, not to each repo."""
@@ -804,6 +880,37 @@ def resolve_alias(cmd, args, cwd):
             break
         cmd, args = parts[0], parts[1:] + args
     return cmd, args, "git", chain
+
+
+def branch_plan(cmd, args):
+    """('switch', branch) or ('create', branch, force) for a plain branch switch, else None."""
+    if "--" in args or interactive(cmd, args):
+        return None
+    create_opts = {"switch": ("-c", "--create", "-C", "--force-create"), "checkout": ("-b", "-B")}[cmd]
+    safe = {"-q", "--quiet", "-f", "--force", "--discard-changes", "-m", "--merge", "--guess",
+            "--no-guess", "--ignore-other-worktrees", "--progress", "--no-progress"}
+    words, create, force, i = [], None, False, 0
+    while i < len(args):
+        a = args[i]
+        if a in create_opts:
+            if i + 1 >= len(args):
+                return None
+            create, force = args[i + 1], a in ("-C", "--force-create", "-B")
+            i += 2
+            continue
+        if cmd == "switch" and a.startswith(("--create=", "--force-create=")):
+            create, force = a.split("=", 1)[1], a.startswith("--force")
+        elif a.startswith("-"):
+            if a not in safe:
+                return None
+        else:
+            words.append(a)
+        i += 1
+    if create is not None:
+        return ("create", create, force) if len(words) <= 1 else None
+    if len(words) == 1 and words[0] != "-":
+        return ("switch", words[0])
+    return None
 
 
 # ---- commands --------------------------------------------------------------------------
@@ -947,17 +1054,26 @@ class Run:
         return " ".join([PROG, *where, "-r", quote(",".join(r.name for r in repos)),
                          *(quote(a) for a in USER_OPTS), *(quote(a) for a in argv)])
 
-    def plan(self):
-        """The repos that are safe to change; skips the others."""
+    def env(self, repo):
+        return dict(os.environ, GITALL_REPO=repo.folder, GITALL_PATH=str(repo.path),
+                    GITALL_ROOT=str(self.ws.root), GITALL_COUNT=str(len(self.repos)),
+                    GITALL_I=str(self.repos.index(repo) + 1 if repo in self.repos else 0))
+
+    def plan(self, args, detached_ok=False, check=True):
+        """[(repo, args for it)] for the repos that are safe to change; skips the others."""
         res = []
         for r in self.repos:
-            prob = r.state.problem()
+            prob = r.state.problem(detached_ok) if check else None
             if prob and r.state.error:
                 self.fail(r, prob, False)      # not a repo git can read
-            elif prob:
+                continue
+            if prob:
                 self.skip(r, prob)
-            else:
-                res.append(r)
+                continue
+            try:
+                res.append((r, absolutize(self.gitcmd[0], expand(args, r), self.o.start)))
+            except Skip as e:
+                self.skip(r, str(e))
         return res
 
     # -- status
@@ -1005,10 +1121,14 @@ class Run:
         user_dry = "dry-run" in opts
         live_commit = bool({"p", "patch", "interactive"} & opts.keys())
         anything = live_commit or bool({"amend", "allow-empty"} & opts.keys())
-        repo_editor = commit_opens_editor(args)
-        todo, unmatched = [], []
-        for r in self.plan():
-            rargs = absolutize("commit", [a.replace("{repo}", r.folder) for a in args], self.o.start)
+        fixup = opts.get("fixup", "")
+        repo_editor = commit_opens_editor(args) and (
+            bool({"amend", "c", "reedit-message", "e", "edit", "squash"} & opts.keys())
+            or fixup.startswith(("amend:", "reword:")))
+        one_editor = commit_opens_editor(args) and not repo_editor and not live_commit
+        templated = any(PLACEHOLDER.search(a) for a in args)
+        todo, previews, unmatched = [], [], []
+        for r, rargs in self.plan(args):
             s = r.state
             if live_commit:
                 if not (s.staged or s.modified):
@@ -1030,8 +1150,16 @@ class Run:
             todo.append((r, rargs))
             header(f"{r.name} ({branch_text(s)}{', ' + sync_text(s) if sync_text(s) else ''})")
             lines = [ln for ln in text.splitlines() if ln[:1] not in (" ", "?")]
+            previews.append((r, lines))
             if lines:
                 out("\n".join(lines))
+            if "amend" in opts:
+                out(f"   amends: {git_ok(r.path, 'log', '-1', '--format=%h %s') or '?'}")
+                if s.tracking and s.ahead == 0:
+                    out(YELLOW("   ! that commit is already pushed: you'd need to force-push"))
+            msg = commit_options(rargs).get("m") or commit_options(rargs).get("message")
+            if templated and msg is not None:
+                out(f"   message: {msg}")
         if not todo:
             if unmatched and not self.failed and len(unmatched) + len(self.skipped) == len(self.repos):
                 die(f"{unmatched[0]} (in any of the repos)", 1)
@@ -1043,15 +1171,31 @@ class Run:
         if user_dry:
             out(f"(dry run: {plural(len(todo), 'repo')} would be committed)")
             self.finish()
-        if repo_editor or live_commit:
+        if one_editor:
+            out(YELLOW("You'll write one commit message for all of them."))
+        elif repo_editor or live_commit:
             out(YELLOW("git will open an editor (or ask questions) in each repo in turn."))
         confirm(f"Commit {plural(len(todo), 'repo')}?", self.o.yes)
+        messages = {}
+        if one_editor:
+            message = self.write_message(previews)
+            for r, _ in todo:                   # fill in {repo} etc. before committing anything
+                try:
+                    messages[r] = expand([message], r)[0]
+                except Skip as e:
+                    self.skip(r, str(e))
+            todo = [(r, rargs) for r, rargs in todo if r in messages]
         for r, rargs in todo:
-            if repo_editor or live_commit:
+            if one_editor:
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as f:
+                    f.write(messages[r])
+                res = git(r.path, "commit", "-q", "-F", f.name, *rargs, env=self.env(r))
+                os.unlink(f.name)
+            elif repo_editor or live_commit:
                 header(r.name)
-                res = git(r.path, "commit", *rargs, live=True)
+                res = git(r.path, "commit", *rargs, live=True, env=self.env(r))
             else:
-                res = git(r.path, "commit", "-q", *rargs)
+                res = git(r.path, "commit", "-q", *rargs, env=self.env(r))
             if res.rc == 0:
                 n = len((git_ok(r.path, "show", "--name-only", "--format=", "HEAD") or "").splitlines())
                 out(f"{r.name}: {GREEN('committed')} {git_ok(r.path, 'log', '-1', '--format=%h %s')} "
@@ -1064,6 +1208,26 @@ class Run:
                 self.fail(r, first_error(res))
         self.finish("commit")
 
+    def write_message(self, previews):
+        """Open the editor once; the message is used for every repo."""
+        lines = ["", f"# One commit message for {plural(len(previews), 'repo')}. Lines starting with '#'",
+                 "# are left out; an empty message aborts. {repo} becomes each repo's folder name.", "#"]
+        for r, files in previews:
+            lines.append(f"# {r.name}:")
+            lines += [f"#   {ln}" for ln in files[:STATUS_FILES]]
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".COMMIT_EDITMSG", delete=False) as f:
+            f.write("\n".join(lines) + "\n")
+        path = Path(f.name)
+        try:
+            ok = run_editor(path, self.o.start)
+            text = path.read_text(encoding="utf-8")
+        finally:
+            path.unlink()
+        message = "\n".join(ln.rstrip() for ln in text.splitlines() if not ln.startswith("#")).strip()
+        if not ok or not message:
+            die("no commit message (the editor failed or the message was empty): nothing committed", 1)
+        return message + "\n"
+
     # -- push
     def push(self, args):
         words = [a for a in args if not a.startswith("-")]
@@ -1074,7 +1238,7 @@ class Run:
                                           "--delete", "-d", "--prune"}
         setup = None
         todo = []
-        for r in self.plan():
+        for r, rargs in self.plan(args):
             s = r.state
             if plain:
                 if s.unborn:
@@ -1094,7 +1258,7 @@ class Run:
                 else:
                     header(f"{r.name} ({branch_text(s)}, {sync_text(s)})")
                     out(git_ok(r.path, "log", "--format=  %h %s", "@{u}..HEAD") or "")
-            todo.append((r, args))
+            todo.append((r, rargs))
         if not todo:
             out("nothing to push")
             self.finish()
@@ -1112,7 +1276,7 @@ class Run:
                 out(RED("This is a force push: it can overwrite commits on the remote."))
             confirm(f"{'Force-push' if force else 'Push'} {plural(len(todo), 'repo')}?", self.o.yes)
         for r, rargs in todo:
-            res = git(r.path, "push", "--porcelain", *rargs)
+            res = git(r.path, "push", "--porcelain", *rargs, env=self.env(r))
             refs = [ln.split("\t") for ln in res.out.splitlines() if ln.count("\t") >= 2]
             if any(f == "!" for f, _, _ in refs) or (res.rc and re.search(r"rejected|fetch first", res.err)):
                 why = next((summary for f, _, summary in refs if f == "!"), "")
@@ -1140,19 +1304,19 @@ class Run:
         live = interactive("pull", args)
         words = [a for a in args if not a.startswith("-")]
         todo = []
-        for r in self.plan():
+        for r, rargs in self.plan(args):
             if not words and not r.state.tracking:
                 why = "its upstream branch is gone" if r.state.upstream else "no upstream branch"
                 self.skip(r, f"{why}, nothing to pull from")
                 continue
-            todo.append((r, args))
+            todo.append((r, rargs))
         rargs_of, uptodate = dict(todo), []
 
         def work(r):
             before = r.state.oid
             if live:
                 header(r.name)
-            res = git(r.path, "pull", "--no-edit", *rargs_of[r], live=live)
+            res = git(r.path, "pull", "--no-edit", *rargs_of[r], live=live, env=self.env(r))
             after = git_ok(r.path, "rev-parse", "-q", "--verify", "HEAD")
             change = describe_change(r.path, before, after) if res.rc == 0 and after != before else None
             r.refresh()
@@ -1182,12 +1346,12 @@ class Run:
 
     # -- fetch
     def fetch(self, args):
-        todo = [(r, args) for r in self.repos]
+        todo = self.plan(args, check=False)
         rargs_of = dict(todo)
         bwidth = min(30, max(len(branch_text(r.state)) for r in self.repos))
 
         def work(r):
-            res = git(r.path, "fetch", *rargs_of[r])
+            res = git(r.path, "fetch", *rargs_of[r], env=self.env(r))
             r.refresh()
             return res
         for r, res in ((r, work(r)) for r, _ in todo):
@@ -1203,16 +1367,80 @@ class Run:
             self.count("fetched" if got else "nothing new", r)
         self.finish("fetch")
 
+    # -- switch / checkout <branch>
+    def switch(self, cmd, args):
+        if branch_plan(cmd, args) is None:
+            return self.passthrough(cmd, args)
+        plans = {r: (rargs, branch_plan(cmd, rargs)) for r, rargs in self.plan(args, detached_ok=True)}
+        if not plans:
+            self.finish()
+        groups, todo = {}, []
+        for r, (rargs, p) in plans.items():
+            s, branch = r.state, p[1]
+            local, _, _ = s.refs()
+            if p[0] == "create":
+                kind = "create" if p[2] or branch not in local else None
+                if kind is None:
+                    self.skip(r, f"already has a branch '{branch}'")
+                    continue
+            elif s.branch == branch:
+                kind = "already on it"
+            elif branch in local:
+                kind = "switch"
+            elif s.remotes_with(branch):
+                kind = f"new branch tracking {s.remotes_with(branch)[0]}/{branch}"
+            else:
+                kind = None
+            groups.setdefault(kind, []).append(r)
+            if kind and kind != "already on it":
+                todo.append((r, rargs))
+        if p[0] == "switch" and None in groups and len(groups) == 1:
+            self.skipped = []
+            return self.passthrough(cmd, args)  # no repo has such a branch: a tag, a commit, a path
+        target = branch_plan(cmd, args)[1]
+        out(f"{'create' if p[0] == 'create' else 'switch to'} {target}:")
+        order = ["create", "switch"] + sorted(k for k in groups if k and k.startswith("new")) + ["already on it", None]
+        for kind, rs in sorted(groups.items(), key=lambda kv: order.index(kv[0])):
+            names = " ".join(r.name + ("*" if r.state.dirty else "") for r in rs)
+            label = kind or "no such branch, skipped"
+            out(f"  {label + ':':<33} {names}")
+        for r in groups.get(None, []):
+            self.skip(r, f"no branch '{plans[r][1][1]}'")
+        if any(r.state.dirty for r, _ in todo):
+            out("  (* has uncommitted changes: git takes them along, or refuses if they'd be lost)")
+        if not todo:
+            out("nothing to do")
+            self.finish()
+        confirm(f"{'Create the branch in' if p[0] == 'create' else 'Switch'} {plural(len(todo), 'repo')}?",
+                self.o.yes)
+        out()
+        for r, rargs in todo:
+            res = git(r.path, cmd, *rargs, env=self.env(r))
+            if res.rc == 0:
+                r.refresh()
+                out(f"{r.name:<{self.width}}  {GREEN('on')} {r.state.branch or branch_text(r.state)}")
+                self.count("switched", r)
+            else:
+                header(r.name)
+                err("\n".join(t for t in (res.out, res.err) if t))
+                self.fail(r, first_error(res))
+        self.finish(cmd)
+
     # -- everything else
     def passthrough(self, cmd, args, alias=None):
         live = interactive(cmd, args)
         shows = read_only(cmd, args) and alias != "shell"
-        todo = [(r, absolutize(cmd, args, self.o.start)) for r in self.repos]
+        todo = self.plan(args, check=False)
         if not (shows or cmd in NO_CONFIRM):
             if alias == "shell":
                 out(f"'{cmd}' is a shell alias: {self.o.alias_chain[-1]}")
-            out(f"Will run:  git {shown([cmd, *args])}")
-            out(f"in: {' '.join(r.name for r, _ in todo)}")
+            if any(rargs != args for _, rargs in todo):
+                out("Will run:")
+                for r, rargs in todo:
+                    out(f"  {r.name}: git {shown([cmd, *rargs])}")
+            else:
+                out(f"Will run:  git {shown([cmd, *args])}")
+                out(f"in: {' '.join(r.name for r, _ in todo)}")
             confirm("Continue?", self.o.yes)
         rargs_of = dict(todo)
         quiet_diff = cmd.startswith("diff") and bool({"--quiet", "--exit-code"} & set(args))
@@ -1221,13 +1449,13 @@ class Run:
         if live:
             for r, _ in todo:
                 header(r.name)
-                res = git(r.path, cmd, *rargs_of[r], live=True)
+                res = git(r.path, cmd, *rargs_of[r], live=True, env=self.env(r))
                 if res.rc:
                     self.fail(r, f"git {cmd} exited with {res.rc}")
             self.finish()
 
         def work(r):
-            return git(r.path, cmd, *rargs_of[r], colour=not self.o.prefix)
+            return git(r.path, cmd, *rargs_of[r], colour=not self.o.prefix, env=self.env(r))
         for r, res in ((r, work(r)) for r, _ in todo):
             blocks.add(r, res)
             # exit 1 from grep / diff --exit-code means "no match" / "has differences", not failure
@@ -1401,6 +1629,8 @@ def main(argv):
     run = Run(ws, repos, o, [cmd, *args])
     if kind == "shell":
         return run.passthrough(cmd, args, alias="shell")
+    if cmd in ("switch", "checkout") and not interactive(cmd, args):
+        return run.switch(cmd, args)
     handler = {"status": run.status, "commit": run.commit, "push": run.push,
                "pull": run.pull, "fetch": run.fetch}.get(cmd)
     if handler:

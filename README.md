@@ -14,9 +14,13 @@ gitall add -A
 gitall commit -m "Fix typos"       # shows what each repo will commit, asks once, commits
 gitall push                        # pushes repos that have unpushed commits, asks first
 gitall pull
+gitall switch {default}            # main in some repos, master in others
 gitall log -3 --oneline
 gitall stash list                  # ...any other git command works too
 ```
+
+Everything from the git command onwards goes to git unchanged. gitall's own options
+go before the git command.
 
 ## Which repos
 
@@ -83,19 +87,40 @@ gitall -r tools -l                             # check a choice before using it
 | `-c name=value`, `--no-pager`, `--literal-pathspecs`, ... | git's own options, passed on to git |
 | `-h` | Help |
 
+## Per-repo values
+
+In the arguments, `{repo}`, `{path}`, `{branch}`, `{upstream}` and `{default}` become each
+repo's folder name, path, current branch, upstream branch and default branch (main, master,
+...). The confirmation shows the command for each repo.
+
+```
+gitall switch {default}
+gitall tag {repo}-v1.0
+gitall commit -am "Weekly edits ({repo})"
+```
+
+In PowerShell, quote them: `'{repo}'`. Repos where a value doesn't exist (no upstream,
+detached HEAD) are skipped with the reason shown. git's `@{upstream}` is left alone.
+
+git commands run with `GITALL_REPO`, `GITALL_PATH`, `GITALL_I` and `GITALL_COUNT` set, so your
+own aliases can use them. A shell alias also runs in each repo (after a confirmation), which
+covers non-git commands: `git config --global alias.make '!make'`, then `gitall make`.
+
 ## What's different from plain git
 
 - **status**: one line per repo (branch, ahead/behind, changes, merge/rebase in progress),
   then the changed files of each repo (up to 10). A repo without an upstream is never shown
   as "clean". Give any option (e.g. `gitall status -s`) to get plain `git status` instead.
-- **commit**: previews each repo's commit and asks once. Repos with nothing to commit are skipped.
-  `{repo}` in the message is replaced by the folder name. `--dry-run` only shows the preview.
-  Without `-m` (or with `-c`, `-e`, `--squash`), git opens an editor for each repo in turn.
+- **commit**: previews each repo's commit and asks once. Repos with nothing to commit are
+  skipped. Without `-m`, you write **one** message for all repos (`{repo}` works in it).
+  `--dry-run` only shows the preview. Amending a commit that is already pushed is flagged.
 - **push**: only repos with unpushed commits, after a preview and one confirmation. If the
   remote has newer commits, it tells you to pull first. Force pushes are flagged.
 - **pull**: one line per repo (fast-forward / merged / rebased); up-to-date repos on one line;
   repos without an upstream are skipped; conflicts are reported, not resolved.
 - **fetch**: one line per repo with what came in, and ahead/behind.
+- **switch / checkout \<branch\>**: shows which repos have the branch (locally or on the
+  remote), asks once, and switches those; repos without it are skipped.
 - **Anything else** runs in every repo. If each repo prints one line, you get one aligned
   line per repo; otherwise each repo's output under its name; repos with no output are left
   out. Commands that change things show what will run and ask first.
@@ -111,13 +136,15 @@ gitall -r tools -l                             # check a choice before using it
 ## Examples
 
 ```
-gitall -r 3 diff                                 # just the 3rd repo
-gitall add -- '*.tex'                            # git pathspecs work as usual
+gitall -r 3 diff                                  # just the 3rd repo
+gitall add -- '*.tex'                             # git pathspecs work as usual
 gitall commit -m "Weekly edits ({repo})" --dry-run
 gitall commit -am "Weekly edits" -y
-gitall commit -m "Fix slides" -- 'slides/*.tex'  # commit only matching files, in every repo
-gitall fetch            # then
-gitall pull
+gitall commit -m "Fix slides" -- 'slides/*.tex'   # commit only matching files, in every repo
+gitall fetch                                      # then
+gitall -r :behind pull
+gitall -r :dirty status
+gitall switch -c feature/x                        # create a branch everywhere
 gitall --prefix grep -n TODO
 ```
 

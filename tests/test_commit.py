@@ -46,6 +46,13 @@ def test_repo_placeholder_in_message(world, run):
     assert last_message(b) == "Weekly edits (Deck2)"
 
 
+def test_preview_shows_the_expanded_message(world, run):
+    world.repo("Deck1")
+    write(world.work / "Deck1" / "main.tex", "changed\n")
+    r = run("commit", "-am", "Edits ({repo})", "--dry-run", cwd=world.work)
+    assert "   message: Edits (Deck1)" in r.out
+
+
 def test_dry_run_only_previews(world, run):
     a, _ = two_repos_one_staged(world)
     before = world.head("A")
@@ -140,16 +147,36 @@ def counting_editor(monkeypatch, world, text):
     return lambda: len(count.read_text().splitlines()) if count.exists() else 0
 
 
-def test_no_message_opens_the_editor_in_each_repo(world, run, monkeypatch):
-    runs = counting_editor(monkeypatch, world, "from-editor")
+def test_no_message_opens_one_editor_for_all_repos(world, run, monkeypatch):
+    runs = counting_editor(monkeypatch, world, "Edits in {repo}")
     a, b = world.repo("A"), world.repo("B")
     for repo in (a, b):
         write(repo / "main.tex", "changed\n")
     r = run("commit", "-a", "-y", cwd=world.work)
     assert r.code == 0, r
-    assert "git will open an editor (or ask questions) in each repo in turn." in r.out
-    assert runs() == 2
-    assert last_message(a) == last_message(b) == "from-editor"
+    assert "You'll write one commit message for all of them." in r.out
+    assert runs() == 1
+    assert last_message(a) == "Edits in A"
+    assert last_message(b) == "Edits in B"
+
+
+def test_empty_message_commits_nothing(world, run, monkeypatch):
+    monkeypatch.setenv("GIT_EDITOR", "true")  # leaves the template: only comments
+    a = world.repo("A")
+    write(a / "main.tex", "changed\n")
+    before = world.head("A")
+    r = run("commit", "-a", "-y", cwd=world.work)
+    assert r.code == 1
+    assert "no commit message" in r.err and "nothing committed" in r.err
+    assert world.head("A") == before
+
+
+def test_failing_editor_commits_nothing(world, run):
+    a = world.repo("A")  # GIT_EDITOR=false from conftest
+    write(a / "main.tex", "changed\n")
+    before = world.head("A")
+    r = run("commit", "-a", "-y", cwd=world.work)
+    assert r.code == 1 and world.head("A") == before
 
 
 @pytest.mark.parametrize("opts", [["-c", "HEAD"], ["--reedit-message=HEAD"], ["-m", "typed", "-e"],
@@ -197,12 +224,16 @@ def test_allow_empty_is_not_filtered_out(world, run):
     assert last_message(a) == last_message(b) == "Empty"
 
 
-def test_amend_rewords_every_repo(world, run):
+def test_amend_rewords_every_repo_and_warns_when_already_pushed(world, run):
     a, b = world.repo("A"), world.repo("B")
     world.local_commit("B", {"x.tex": "x"}, "local")
     r = run("commit", "--amend", "-m", "Reworded", "-y", cwd=world.work)
     assert r.code == 0, r
     assert last_message(a) == last_message(b) == "Reworded"
+    assert "amends: " in r.out and "initial" in r.out
+    # A's commit was pushed, B's wasn't
+    a_part, b_part = r.out.split("== B")
+    assert "already pushed" in a_part and "already pushed" not in b_part.split("A: committed")[0]
 
 
 def test_commit_patch_runs_attached_and_only_where_there_are_changes(world, run_script):
