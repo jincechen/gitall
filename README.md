@@ -119,6 +119,8 @@ covers non-git commands: `git config --global alias.make '!make'`, then `gitall 
 - **pull**: one line per repo (fast-forward / merged / rebased); up-to-date repos on one line;
   repos without an upstream are skipped; conflicts are reported, not resolved.
 - **fetch**: one line per repo with what came in, and ahead/behind.
+- **switch / checkout \<branch\>**: shows which repos have the branch (locally or on the
+  remote), asks once, and switches those; repos without it are skipped.
 - **Anything else** runs in every repo. If each repo prints one line, you get one aligned
   line per repo; otherwise each repo's output under its name; repos with no output are left
   out. Commands that change things show what will run and ask first.
@@ -134,13 +136,15 @@ covers non-git commands: `git config --global alias.make '!make'`, then `gitall 
 ## Examples
 
 ```
-gitall -r 3 diff                                 # just the 3rd repo
-gitall add -- '*.tex'                            # git pathspecs work as usual
+gitall -r 3 diff                                  # just the 3rd repo
+gitall add -- '*.tex'                             # git pathspecs work as usual
 gitall commit -m "Weekly edits ({repo})" --dry-run
 gitall commit -am "Weekly edits" -y
-gitall commit -m "Fix slides" -- 'slides/*.tex'  # commit only matching files, in every repo
-gitall fetch            # then
-gitall pull
+gitall commit -m "Fix slides" -- 'slides/*.tex'   # commit only matching files, in every repo
+gitall fetch                                      # then
+gitall -r :behind pull
+gitall -r :dirty status
+gitall switch -c feature/x                        # create a branch everywhere
 gitall --prefix grep -n TODO
 ```
 
