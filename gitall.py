@@ -8,10 +8,8 @@ arguments mean what they mean in git. A few commands get extra help:
 
   status          one line per repo (branch, ahead/behind, changes), then the changed
                   files; give any status option (e.g. -s) for plain git status
-  commit          previews what each repo would commit, asks once, then commits;
-                  repos with nothing to commit are skipped; {repo} in the message
-                  becomes the repo's folder name; --dry-run only previews;
-                  without -m (or with -c, -e, --squash) git opens an editor per repo
+  commit          previews each repo's commit and asks once; repos with nothing to
+                  commit are skipped; without -m you write one message for all repos
   push            only repos with unpushed commits; previews them and asks once
   pull            one line per repo: fast-forward, merged, up to date or CONFLICT
   fetch           one line per repo: what came in, then ahead/behind
@@ -59,8 +57,10 @@ import fnmatch
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -268,6 +268,30 @@ def first_error(res):
         if ln.startswith(("fatal:", "error:")):
             return ln
     return lines[0] if lines else f"git exited with {res.rc}"
+
+
+def find_sh():
+    if os.name != "nt":
+        return shutil.which("sh") or "/bin/sh"
+    found = shutil.which("sh")
+    if found:
+        return found
+    exec_path = git_ok(Path.cwd(), "--exec-path")       # <git>/mingw64/libexec/git-core
+    if exec_path:
+        top = Path(exec_path).parents[2]
+        for sh in (top / "usr" / "bin" / "sh.exe", top / "bin" / "sh.exe"):
+            if sh.exists():
+                return str(sh)
+    return None
+
+
+def run_editor(path, cwd):
+    """Open git's editor on path, the way git does. True if it exited cleanly."""
+    editor = git_ok(cwd, "var", "GIT_EDITOR") or "vi"
+    sh = find_sh()
+    if sh:
+        return subprocess.call([sh, "-c", f'{editor} "$@"', editor, path.as_posix()], cwd=cwd) == 0
+    return subprocess.call(f'{editor} "{path}"', shell=True, cwd=cwd) == 0
 
 
 # ---- repos ---------------------------------------------------------------------------
@@ -1097,9 +1121,13 @@ class Run:
         user_dry = "dry-run" in opts
         live_commit = bool({"p", "patch", "interactive"} & opts.keys())
         anything = live_commit or bool({"amend", "allow-empty"} & opts.keys())
-        repo_editor = commit_opens_editor(args)
+        fixup = opts.get("fixup", "")
+        repo_editor = commit_opens_editor(args) and (
+            bool({"amend", "c", "reedit-message", "e", "edit", "squash"} & opts.keys())
+            or fixup.startswith(("amend:", "reword:")))
+        one_editor = commit_opens_editor(args) and not repo_editor and not live_commit
         templated = any(PLACEHOLDER.search(a) for a in args)
-        todo, unmatched = [], []
+        todo, previews, unmatched = [], [], []
         for r, rargs in self.plan(args):
             s = r.state
             if live_commit:
@@ -1122,8 +1150,13 @@ class Run:
             todo.append((r, rargs))
             header(f"{r.name} ({branch_text(s)}{', ' + sync_text(s) if sync_text(s) else ''})")
             lines = [ln for ln in text.splitlines() if ln[:1] not in (" ", "?")]
+            previews.append((r, lines))
             if lines:
                 out("\n".join(lines))
+            if "amend" in opts:
+                out(f"   amends: {git_ok(r.path, 'log', '-1', '--format=%h %s') or '?'}")
+                if s.tracking and s.ahead == 0:
+                    out(YELLOW("   ! that commit is already pushed: you'd need to force-push"))
             msg = commit_options(rargs).get("m") or commit_options(rargs).get("message")
             if templated and msg is not None:
                 out(f"   message: {msg}")
@@ -1138,11 +1171,27 @@ class Run:
         if user_dry:
             out(f"(dry run: {plural(len(todo), 'repo')} would be committed)")
             self.finish()
-        if repo_editor or live_commit:
+        if one_editor:
+            out(YELLOW("You'll write one commit message for all of them."))
+        elif repo_editor or live_commit:
             out(YELLOW("git will open an editor (or ask questions) in each repo in turn."))
         confirm(f"Commit {plural(len(todo), 'repo')}?", self.o.yes)
+        messages = {}
+        if one_editor:
+            message = self.write_message(previews)
+            for r, _ in todo:                   # fill in {repo} etc. before committing anything
+                try:
+                    messages[r] = expand([message], r)[0]
+                except Skip as e:
+                    self.skip(r, str(e))
+            todo = [(r, rargs) for r, rargs in todo if r in messages]
         for r, rargs in todo:
-            if repo_editor or live_commit:
+            if one_editor:
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as f:
+                    f.write(messages[r])
+                res = git(r.path, "commit", "-q", "-F", f.name, *rargs, env=self.env(r))
+                os.unlink(f.name)
+            elif repo_editor or live_commit:
                 header(r.name)
                 res = git(r.path, "commit", *rargs, live=True, env=self.env(r))
             else:
@@ -1158,6 +1207,26 @@ class Run:
                     out(indent("\n".join(t for t in (res.out, res.err) if t)))
                 self.fail(r, first_error(res))
         self.finish("commit")
+
+    def write_message(self, previews):
+        """Open the editor once; the message is used for every repo."""
+        lines = ["", f"# One commit message for {plural(len(previews), 'repo')}. Lines starting with '#'",
+                 "# are left out; an empty message aborts. {repo} becomes each repo's folder name.", "#"]
+        for r, files in previews:
+            lines.append(f"# {r.name}:")
+            lines += [f"#   {ln}" for ln in files[:STATUS_FILES]]
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".COMMIT_EDITMSG", delete=False) as f:
+            f.write("\n".join(lines) + "\n")
+        path = Path(f.name)
+        try:
+            ok = run_editor(path, self.o.start)
+            text = path.read_text(encoding="utf-8")
+        finally:
+            path.unlink()
+        message = "\n".join(ln.rstrip() for ln in text.splitlines() if not ln.startswith("#")).strip()
+        if not ok or not message:
+            die("no commit message (the editor failed or the message was empty): nothing committed", 1)
+        return message + "\n"
 
     # -- push
     def push(self, args):

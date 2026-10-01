@@ -111,9 +111,9 @@ covers non-git commands: `git config --global alias.make '!make'`, then `gitall 
 - **status**: one line per repo (branch, ahead/behind, changes, merge/rebase in progress),
   then the changed files of each repo (up to 10). A repo without an upstream is never shown
   as "clean". Give any option (e.g. `gitall status -s`) to get plain `git status` instead.
-- **commit**: previews each repo's commit and asks once. Repos with nothing to commit are skipped.
-  `{repo}` in the message is replaced by the folder name. `--dry-run` only shows the preview.
-  Without `-m` (or with `-c`, `-e`, `--squash`), git opens an editor for each repo in turn.
+- **commit**: previews each repo's commit and asks once. Repos with nothing to commit are
+  skipped. Without `-m`, you write **one** message for all repos (`{repo}` works in it).
+  `--dry-run` only shows the preview. Amending a commit that is already pushed is flagged.
 - **push**: only repos with unpushed commits, after a preview and one confirmation. If the
   remote has newer commits, it tells you to pull first. Force pushes are flagged.
 - **pull**: one line per repo (fast-forward / merged / rebased); up-to-date repos on one line;
