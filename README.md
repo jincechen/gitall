@@ -35,6 +35,7 @@ go before the git command.
   archive/*                # paths and path globs reach deeper repos
   [tools]                  # a group: the lines below also belong to "tools"
   scripts
+  build-tools  https://github.com/me/build-tools.git   # gitall clone fetches it if missing
   []                       # ends the group
   jobs = 8                 # default for -j
   ```
@@ -123,6 +124,7 @@ covers non-git commands: `git config --global alias.make '!make'`, then `gitall 
 - **fetch**: one line per repo with what came in, and ahead/behind.
 - **switch / checkout \<branch\>**: shows which repos have the branch (locally or on the
   remote), asks once, and switches those; repos without it are skipped.
+- **clone** with no URL: clones the repos listed with a URL in `.gitall` that are missing.
 - **Anything else** runs in every repo. If each repo prints one line, you get one aligned
   line per repo; otherwise each repo's output under its name; repos with no output are left
   out. Commands that change things show what will run and ask first.
