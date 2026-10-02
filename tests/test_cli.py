@@ -28,9 +28,15 @@ def test_unknown_option(world, run):
 def test_option_missing_its_value(world, run):
     r = run("status", "-r", cwd=world.work)  # after the command: goes to git, not to gitall
     assert "needs a value" not in r.err
-    for opt in ("-r", "-x", "-C"):
+    for opt in ("-r", "-x", "-C", "-j"):
         r = run(opt, cwd=world.work)
         assert r.code == 2 and f"{opt} needs a value" in r.err
+
+
+def test_jobs_needs_a_number(world, run):
+    world.repo("A", remote=False)
+    r = run("-j", "lots", "status", cwd=world.work)
+    assert r.code == 2 and "needs a number" in r.err
 
 
 def test_git_version_runs_once(world, run):

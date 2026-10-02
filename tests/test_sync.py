@@ -3,7 +3,7 @@ import re
 
 
 from conftest import git, write
-from helpers import make_problem
+from helpers import log_fetches, logged, make_problem
 
 
 # ---- push --------------------------------------------------------------------------------
@@ -310,3 +310,71 @@ def test_fetch_failure_does_not_stop_the_others(world, run):
     assert re.search(r"Failed:\n  B: fatal: .*gone\.git", r.out), r
     assert "retry:  gitall -r B fetch" in r.out
     assert "fetch: 1 fetched, 1 failed" in r.out
+
+
+# ---- -j: several repos at once ---------------------------------------------------------------
+def three_behind(world, tmp_path, delay_first=0):
+    log = tmp_path / "fetches.log"
+    for i, name in enumerate(("A", "B", "C")):
+        repo = world.repo(name)
+        world.coauthor_edit(name, {"main.tex": f"overleaf {name}\n"})
+        log_fetches(repo, log, delay=delay_first if i == 0 else 0)
+    return log
+
+
+def rows(out):
+    return [ln.split()[0] for ln in out.splitlines() if re.match(r"^[ABC] ", ln)]
+
+
+def test_parallel_fetch_keeps_list_order(world, run, tmp_path):
+    log = three_behind(world, tmp_path, delay_first=1)   # A finishes last
+    r = run("-j", "3", "fetch", cwd=world.work)
+    assert r.code == 0, r
+    assert rows(r.out) == ["A", "B", "C"]
+    assert r.out.count("main  behind 1  (1 updated)") == 3
+    assert logged(log) == {"A": "never", "B": "never", "C": "never"}   # ran without prompts
+
+
+def test_sequential_fetch_allows_prompts(world, run, tmp_path):
+    log = three_behind(world, tmp_path)
+    r = run("fetch", cwd=world.work)
+    assert r.code == 0, r
+    assert logged(log) == {"A": "", "B": "", "C": ""}
+
+
+def test_parallel_pull_matches_sequential(world, run, tmp_path):
+    log = three_behind(world, tmp_path, delay_first=1)
+    r = run("-j3", "pull", cwd=world.work)
+    assert r.code == 0, r
+    assert rows(r.out) == ["A", "B", "C"]
+    assert r.out.count("fast-forward, 1 commit, 1 file changed") == 3
+    assert set(logged(log).values()) == {"never"}
+    for name in ("A", "B", "C"):
+        assert world.head(name) == world.remote_head(name)
+
+
+def test_parallel_push(world, run):
+    for name in ("A", "B", "C"):
+        world.repo(name)
+        world.local_commit(name, {"x.tex": name})
+    r = run("--jobs=2", "push", "-y", cwd=world.work)
+    assert r.code == 0, r
+    pushed = [ln.split(":")[0] for ln in r.out.splitlines() if ": pushed main" in ln]
+    assert pushed == ["A", "B", "C"]
+    for name in ("A", "B", "C"):
+        assert world.head(name) == world.remote_head(name)
+
+
+def test_jobs_setting_in_gitall_file(world, run, tmp_path):
+    log = three_behind(world, tmp_path)
+    write(world.work / ".gitall", "jobs = 3\nA\nB\nC\n")
+    r = run("fetch", cwd=world.work)
+    assert r.code == 0, r
+    assert set(logged(log).values()) == {"never"}
+
+
+def test_jobs_option_overrides_gitall_file(world, run, tmp_path):
+    log = three_behind(world, tmp_path)
+    write(world.work / ".gitall", "jobs = 3\nA\nB\nC\n")
+    run("-j", "1", "fetch", cwd=world.work)
+    assert set(logged(log).values()) == {""}

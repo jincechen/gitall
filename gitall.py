@@ -36,6 +36,8 @@ Choosing repos (these options go before the git command):
 Other options:
   -y, --yes           don't ask for confirmation (also accepted as the last argument)
   -q, --quiet         leave out repos with nothing to report
+  -j, --jobs N        fetch/pull/push/clone, and commands that only show things, run
+                      in N repos at once
   --prefix            start each output line with the repo's path (grep, ls-files, ...)
   -C DIR              start in DIR instead of the current directory
   -c NAME=VALUE, --no-pager, --literal-pathspecs, ...
@@ -50,7 +52,7 @@ Which repos: those listed in the nearest .gitall file (in the current directory 
 parent); else every git repo directly inside the current directory; else, inside a
 repo, that repo and its siblings. A .gitall file has one entry per line: a name, a
 path or a glob ('Deck*', 'archive/*'); '!entry' leaves repos out; '[name]' starts a
-group and '[]' ends it; # starts a comment.
+group and '[]' ends it; 'jobs = N' sets a default for -j; # starts a comment.
 """
 import errno
 import fnmatch
@@ -62,6 +64,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 PROG = Path(__file__).stem              # rename the file and messages/config name follow
@@ -134,6 +137,9 @@ GIT_REFUSED = ("--git-dir", "--work-tree", "--namespace", "--bare", "--exec-path
 
 PLACEHOLDER = re.compile(r"(?<!@)\{(repo|path|branch|upstream|default)\}")
 GLOB_CHARS = "*?["
+AUTH_FAILED = re.compile(r"terminal prompts disabled|could not read (Username|Password)|"
+                         r"Authentication failed|Permission denied \(publickey|"
+                         r"Host key verification failed|Access denied|returned error: 40[13]")
 STATUS_FILES = 10                       # changed files listed per repo by status
 
 NO_COLOR = bool(os.environ.get("NO_COLOR"))
@@ -239,10 +245,11 @@ def _text(b):
     return b.decode("utf-8", "replace").rstrip("\n")
 
 
-def git(cwd, *args, live=False, colour=False, internal=False, env=None):
+def git(cwd, *args, live=False, colour=False, internal=False, env=None, batch=False):
     """Run git in cwd -> Res(rc, out, err).
     internal: for gitall's own queries (plain, uncoloured output);
-    live: attached to the terminal (editors, prompts)."""
+    live: attached to the terminal (editors, prompts);
+    batch: no prompts at all (parallel runs)."""
     if internal:
         cmd = ["git", *USER_OPTS, "-c", "core.quotePath=false", "-c", "color.ui=never"]
     else:
@@ -253,7 +260,8 @@ def git(cwd, *args, live=False, colour=False, internal=False, env=None):
     cmd += ["--no-pager", *args]
     if live:
         return Res(subprocess.call(cmd, cwd=cwd, env=env), "", "")
-    p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.run(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL if batch else None,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return Res(p.returncode, _text(p.stdout), _text(p.stderr))
 
 
@@ -491,11 +499,22 @@ class Repo:
         return f"<Repo {self.name}>"
 
 
+def load_states(repos):
+    """Work out the state of many repos at once (git status in parallel)."""
+    todo = [r for r in repos if r._state is None]
+    if len(todo) > 1:
+        with ThreadPoolExecutor(min(8, len(todo))) as ex:
+            for r, s in zip(todo, ex.map(lambda r: State(r.path), todo)):
+                r._state = s
+    return repos
+
+
 # ---- which repos ---------------------------------------------------------------------
 class Workspace:
     def __init__(self, root, config=None):
         self.root, self.config = root, config
         self.repos, self.groups, self.hidden, self.warnings = [], {}, [], []
+        self.jobs = None
 
 
 def find_workspace(start):
@@ -548,6 +567,10 @@ def read_config(root, cfg):
             group = m.group(1) or None                    # [] ends the group
             if group:
                 ws.groups.setdefault(group.lower(), (group, []))
+            continue
+        m = re.fullmatch(r"jobs\s*=\s*(\d+)", line)
+        if m:
+            ws.jobs = int(m.group(1))
             continue
         exclude = line.startswith("!")
         entry = line.lstrip("!").strip()
@@ -647,6 +670,8 @@ def select(ws, picks, drops):
                 no_match(ws, term)
             hits.update(found)
         chosen = [r for r in ws.repos if r in hits]
+    if states or any(t.startswith(":") for t in excluded):
+        load_states(chosen)
     if states:
         chosen = [r for r in chosen if any(test(r) for test in states)]
     for term in excluded:
@@ -1054,14 +1079,44 @@ class Run:
         return " ".join([PROG, *where, "-r", quote(",".join(r.name for r in repos)),
                          *(quote(a) for a in USER_OPTS), *(quote(a) for a in argv)])
 
-    def env(self, repo):
-        return dict(os.environ, GITALL_REPO=repo.folder, GITALL_PATH=str(repo.path),
-                    GITALL_ROOT=str(self.ws.root), GITALL_COUNT=str(len(self.repos)),
-                    GITALL_I=str(self.repos.index(repo) + 1 if repo in self.repos else 0))
+    def env(self, repo, batch=False):
+        e = dict(os.environ, GITALL_REPO=repo.folder, GITALL_PATH=str(repo.path),
+                 GITALL_ROOT=str(self.ws.root), GITALL_COUNT=str(len(self.repos)),
+                 GITALL_I=str(self.repos.index(repo) + 1 if repo in self.repos else 0))
+        if batch:
+            e.update(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+        return e
+
+    def each(self, repos, work, parallel=True):
+        """Yield (repo, work(repo, batch)) in list order; with -j N, N at a time.
+        Repos that needed a password are retried one at a time at the end."""
+        jobs = (self.o.jobs or self.ws.jobs or 1) if parallel else 1
+        if jobs <= 1 or len(repos) < 2:
+            for r in repos:
+                yield r, work(r, False)
+            return
+        retry = []
+        with ThreadPoolExecutor(jobs) as ex:
+            futures = [(r, ex.submit(work, r, True)) for r in repos]
+            for r, f in futures:
+                res = f.result()
+                first = res[0] if isinstance(res, tuple) else res
+                if first.rc and AUTH_FAILED.search(first.err):
+                    retry.append(r)
+                    continue
+                yield r, res
+        if retry:
+            out()
+            out(f"retrying {plural(len(retry), 'repo')} one at a time (may ask for a password): "
+                f"{' '.join(r.name for r in retry)}")
+            for r in retry:
+                yield r, work(r, False)
 
     def plan(self, args, detached_ok=False, check=True):
         """[(repo, args for it)] for the repos that are safe to change; skips the others."""
         res = []
+        if check:
+            load_states(self.repos)
         for r in self.repos:
             prob = r.state.problem(detached_ok) if check else None
             if prob and r.state.error:
@@ -1081,8 +1136,11 @@ class Run:
         if any(a.startswith("-") and a != "--" for a in args):
             return self.passthrough("status", args)
         paths = [a for a in args if a != "--"]
-        for r in self.repos if paths else []:
-            r._state = State(r.path, paths)
+        if paths:
+            with ThreadPoolExecutor(8) as ex:
+                for r, s in zip(self.repos, ex.map(lambda r: State(r.path, paths), self.repos)):
+                    r._state = s
+        load_states(self.repos)
         bwidth = min(30, max(len(branch_text(r.state)) for r in self.repos))
         details = []
         for r in self.repos:
@@ -1275,8 +1333,11 @@ class Run:
             if force:
                 out(RED("This is a force push: it can overwrite commits on the remote."))
             confirm(f"{'Force-push' if force else 'Push'} {plural(len(todo), 'repo')}?", self.o.yes)
-        for r, rargs in todo:
-            res = git(r.path, "push", "--porcelain", *rargs, env=self.env(r))
+        rargs_of = dict(todo)
+
+        def work(r, batch):
+            return git(r.path, "push", "--porcelain", *rargs_of[r], env=self.env(r, batch), batch=batch)
+        for r, res in self.each([r for r, _ in todo], work):
             refs = [ln.split("\t") for ln in res.out.splitlines() if ln.count("\t") >= 2]
             if any(f == "!" for f, _, _ in refs) or (res.rc and re.search(r"rejected|fetch first", res.err)):
                 why = next((summary for f, _, summary in refs if f == "!"), "")
@@ -1312,18 +1373,18 @@ class Run:
             todo.append((r, rargs))
         rargs_of, uptodate = dict(todo), []
 
-        def work(r):
+        def work(r, batch):
             before = r.state.oid
             if live:
                 header(r.name)
-            res = git(r.path, "pull", "--no-edit", *rargs_of[r], live=live, env=self.env(r))
+            res = git(r.path, "pull", "--no-edit", *rargs_of[r], live=live, env=self.env(r, batch), batch=batch)
             after = git_ok(r.path, "rev-parse", "-q", "--verify", "HEAD")
             change = describe_change(r.path, before, after) if res.rc == 0 and after != before else None
             r.refresh()
             conflicts = (git_ok(r.path, "diff", "--name-only", "--diff-filter=U") or "").split("\n") \
                 if res.rc else []
             return res, change, [c for c in conflicts if c]
-        for r, (res, change, conflicts) in ((r, work(r)) for r, _ in todo):
+        for r, (res, change, conflicts) in self.each([r for r, _ in todo], work, parallel=not live):
             if res.rc == 0 and change is None:
                 uptodate.append(r.name)
                 self.count("up to date", r)
@@ -1348,13 +1409,14 @@ class Run:
     def fetch(self, args):
         todo = self.plan(args, check=False)
         rargs_of = dict(todo)
-        bwidth = min(30, max(len(branch_text(r.state)) for r in self.repos))
+        bwidth = min(30, max(len(branch_text(r.state)) for r in load_states(self.repos)))
 
-        def work(r):
-            res = git(r.path, "fetch", *rargs_of[r], env=self.env(r))
+        def work(r, batch):
+            res = git(r.path, "fetch", *rargs_of[r], env=self.env(r, batch), batch=batch)
             r.refresh()
+            r.state.refs()
             return res
-        for r, res in ((r, work(r)) for r, _ in todo):
+        for r, res in self.each([r for r, _ in todo], work):
             if res.rc:
                 out(f"{r.name}: {RED('fetch failed')}")
                 out(indent(res.err or res.out))
@@ -1454,9 +1516,9 @@ class Run:
                     self.fail(r, f"git {cmd} exited with {res.rc}")
             self.finish()
 
-        def work(r):
-            return git(r.path, cmd, *rargs_of[r], colour=not self.o.prefix, env=self.env(r))
-        for r, res in ((r, work(r)) for r, _ in todo):
+        def work(r, batch):
+            return git(r.path, cmd, *rargs_of[r], colour=not self.o.prefix, env=self.env(r, batch), batch=batch)
+        for r, res in self.each([r for r, _ in todo], work, parallel=shows):
             blocks.add(r, res)
             # exit 1 from grep / diff --exit-code means "no match" / "has differences", not failure
             if cmd == "grep" and res.rc in (0, 1):
@@ -1509,6 +1571,7 @@ def fetched_summary(text):
 
 
 def list_repos(ws, chosen, picked):
+    load_states(chosen)
     where = f"in {ws.root}" + (f" (from {CONFIG})" if ws.config else "")
     total = f"{len(chosen)} of {len(ws.repos)}" if picked else f"{len(ws.repos)}"
     out(f"{total} repo(s) {where}")
@@ -1538,10 +1601,12 @@ def main(argv):
     o, i = Options(), 0
     USER_OPTS.clear()
     with_value = {"-r": "picks", "--repo": "picks", "-x": "drops", "--exclude": "drops",
-                  "-C": "start", "-c": "config", "--config-env": "config-env"}
+                  "-C": "start", "-c": "config", "--config-env": "config-env", "-j": "jobs", "--jobs": "jobs"}
     while i < len(argv):
         a = argv[i]
         name, eq, value = a.partition("=") if a.startswith("--") else (a, "", "")
+        if re.fullmatch(r"-j\d+", a):
+            name, eq, value = "-j", "=", a[2:]
         if name in with_value:
             if not eq:
                 if i + 1 >= len(argv):
@@ -1555,6 +1620,10 @@ def main(argv):
                 o.start = (o.start / value).resolve()
                 if not o.start.is_dir():
                     die(f"-C: no such directory: {o.start}")
+            elif what == "jobs":
+                if not value.isdigit() or int(value) < 1:
+                    die(f"{name} needs a number of repos, e.g. {name} 8")
+                o.jobs = int(value)
             elif what == "config":
                 USER_OPTS.extend(["-c", value])
             else:
