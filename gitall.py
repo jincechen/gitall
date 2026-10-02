@@ -15,6 +15,7 @@ arguments mean what they mean in git. A few commands get extra help:
   fetch           one line per repo: what came in, then ahead/behind
   switch/checkout <branch>
                   previews which repos have the branch, asks once; the others are skipped
+  clone           with no URL: clones the repos listed in .gitall that are missing
   anything else   runs in every repo; repos with no output are left out; commands
                   that change things show what will run and ask first
 
@@ -52,7 +53,8 @@ Which repos: those listed in the nearest .gitall file (in the current directory 
 parent); else every git repo directly inside the current directory; else, inside a
 repo, that repo and its siblings. A .gitall file has one entry per line: a name, a
 path or a glob ('Deck*', 'archive/*'); '!entry' leaves repos out; '[name]' starts a
-group and '[]' ends it; 'jobs = N' sets a default for -j; # starts a comment.
+group and '[]' ends it; 'name  URL' (two spaces) lets gitall clone it; 'jobs = N' sets a
+default for -j; # starts a comment.
 """
 import errno
 import fnmatch
@@ -137,6 +139,7 @@ GIT_REFUSED = ("--git-dir", "--work-tree", "--namespace", "--bare", "--exec-path
 
 PLACEHOLDER = re.compile(r"(?<!@)\{(repo|path|branch|upstream|default)\}")
 GLOB_CHARS = "*?["
+URL = re.compile(r"(\S+://\S+|[\w.-]+@[\w.-]+:\S+|\S+\.git)$")
 AUTH_FAILED = re.compile(r"terminal prompts disabled|could not read (Username|Password)|"
                          r"Authentication failed|Permission denied \(publickey|"
                          r"Host key verification failed|Access denied|returned error: 40[13]")
@@ -484,6 +487,7 @@ class Repo:
             self.name = path.relative_to(root).as_posix()
         except ValueError:
             self.name = path.name
+        self.url = None
         self._state = None
 
     @property
@@ -513,7 +517,7 @@ def load_states(repos):
 class Workspace:
     def __init__(self, root, config=None):
         self.root, self.config = root, config
-        self.repos, self.groups, self.hidden, self.warnings = [], {}, [], []
+        self.repos, self.groups, self.missing, self.hidden, self.warnings = [], {}, [], [], []
         self.jobs = None
 
 
@@ -573,20 +577,29 @@ def read_config(root, cfg):
             ws.jobs = int(m.group(1))
             continue
         exclude = line.startswith("!")
-        entry = line.lstrip("!").strip()
+        entry, url = line.lstrip("!").strip(), None
+        m = re.fullmatch(r"(.*?\S)(\s+)(\S+)", entry)
+        # name URL; a plain path ending in .git only after two spaces ('my repo.git' is a name)
+        if m and not exclude and URL.match(m.group(3)) and \
+                (re.match(r"\S+://|[\w.-]+@[\w.-]+:", m.group(3)) or len(m.group(2)) > 1 or "\t" in m.group(2)):
+            entry, url = m.group(1), m.group(3)
         entry = entry.replace("\\", "/").rstrip("/")
         hits = config_entry(root, entry)
         if exclude:
             excluded |= {key(p) for p in hits}
             continue
         if not hits:
-            ws.warnings.append(f"{cfg}, line {n}: '{entry}' is not a git repo, left out")
+            if url and not any(ch in entry for ch in GLOB_CHARS):
+                ws.missing.append((entry, url))
+            else:
+                ws.warnings.append(f"{cfg}, line {n}: '{entry}' is not a git repo, left out")
             continue
         for p in hits:
             r = known.get(key(p))
             if r is None:
                 r = known[key(p)] = Repo(p, root)
                 ws.repos.append(r)
+            r.url = url or r.url
             if group and r not in ws.groups[group.lower()][1]:
                 ws.groups[group.lower()][1].append(r)
     ws.repos = [r for r in ws.repos if key(r.path) not in excluded]
@@ -1488,6 +1501,31 @@ class Run:
                 self.fail(r, first_error(res))
         self.finish(cmd)
 
+    # -- clone the missing repos from .gitall
+    def clone_missing(self):
+        if not self.ws.missing:
+            note = "" if self.ws.config else f" (list them as 'name  URL' lines in a {CONFIG} file)"
+            out(f"nothing to clone: no listed repo is missing{note}")
+            return 0
+        for name, url in self.ws.missing:
+            out(f"  {name}  <-  {url}")
+        confirm(f"Clone {plural(len(self.ws.missing), 'repo')} into {self.ws.root}?", self.o.yes)
+        targets = [Repo(self.ws.root / name, self.ws.root) for name, _ in self.ws.missing]
+        url_of = {r.name: url for r, (_, url) in zip(targets, self.ws.missing)}
+
+        def work(r, batch):
+            env = dict(os.environ, **({"GIT_TERMINAL_PROMPT": "0"} if batch else {}))
+            return git(self.ws.root, "clone", url_of[r.name], r.name, env=env, batch=batch)
+        for r, res in self.each(targets, work):
+            if res.rc == 0:
+                out(f"{r.name}: {GREEN('cloned')}")
+                self.count("cloned", r)
+            else:
+                out(f"{r.name}: {RED('clone failed')}")
+                out(indent(res.err or res.out))
+                self.fail(r, first_error(res), False)
+        self.finish("clone")
+
     # -- everything else
     def passthrough(self, cmd, args, alias=None):
         live = interactive(cmd, args)
@@ -1550,6 +1588,7 @@ def describe_change(path, before, after):
     stat = (git_ok(path, "diff", "--shortstat", before, after) or "").strip().split(",")[0]
     return ", ".join(t for t in (kind, plural(n, "commit"), stat) if t)
 
+
 FETCH_LINE = re.compile(r"^ ([ +\-t*!=]) (\[[^\]]+\]|\S+)\s+\S.*?->\s+\S+")
 
 
@@ -1582,6 +1621,8 @@ def list_repos(ws, chosen, picked):
             out(f"{ws.repos.index(r) + 1:3}  {repo_row(r, width, bwidth)}")
     if ws.groups:
         out("groups: " + ", ".join(f"{name} ({len(rs)})" for name, rs in ws.groups.values()))
+    if ws.missing:
+        out(f"missing ({PROG} clone gets them): " + ", ".join(name for name, _ in ws.missing))
     if ws.hidden:
         out("left out: " + ", ".join(ws.hidden))
     return 0
@@ -1662,6 +1703,7 @@ def main(argv):
     cmd, args = (argv[i], argv[i + 1:]) if i < len(argv) else (None, [])
     args, yes = strip_yes(args)
     o.yes |= yes
+    gitcmd = [cmd, *args] if cmd else []
 
     if cmd:
         cmd, args, kind, o.alias_chain = resolve_alias(cmd, args, o.start)
@@ -1685,9 +1727,14 @@ def main(argv):
     ws = find_workspace(o.start)
     for w in ws.warnings:
         err(YELLOW(f"{PROG}: {w}"))
+    if cmd == "clone":
+        return Run(ws, [], o, gitcmd).clone_missing()
+    if not ws.repos and o.list and ws.missing:
+        return list_repos(ws, [], False)
     if not ws.repos:
-        die(f"no git repos found in {ws.root} (run it in or inside the folder that contains "
-            f"your repos, or list them in a {CONFIG} file)")
+        hint = f"; {PROG} clone gets the ones listed in {ws.config}" if ws.missing else \
+            f" (run it in or inside the folder that contains your repos, or list them in a {CONFIG} file)"
+        die(f"no git repos found in {ws.root}{hint}")
     repos = select(ws, o.picks, o.drops)
     if o.list:
         return list_repos(ws, repos, bool(o.picks or o.drops))

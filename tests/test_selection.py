@@ -269,6 +269,24 @@ def test_star_does_not_match_hidden_folders(world, run):
     assert pick(run, world) == ["A", ".hidden"]
 
 
+def test_url_lines_and_missing_repos(world, run):
+    world.repo("A", remote=False)
+    write(world.work / ".gitall", f"A  https://example.com/A.git\nB  {world.remotes / 'B.git'}\n"
+                                  "C git@example.com:me/C.git\n")
+    r = run("-l", cwd=world.work)
+    assert r.code == 0, r
+    assert listed(r) == ["A"]
+    assert "missing (gitall clone gets them): B, C" in r.out
+    assert "not a git repo" not in r.err
+
+
+def test_list_with_only_missing_repos(world, run):
+    write(world.work / ".gitall", f"B  {world.remotes / 'B.git'}\n")
+    r = run("-l", cwd=world.work)
+    assert r.code == 0, r
+    assert "missing (gitall clone gets them): B" in r.out
+
+
 def test_running_inside_a_linked_worktree_includes_it(world, run):
     a = world.repo("A", remote=False)
     git(a, "worktree", "add", "-q", str(world.work / "A-wt"))
