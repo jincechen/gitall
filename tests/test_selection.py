@@ -284,6 +284,13 @@ def test_names_with_spaces(world, run):
     assert "My Deck" in run("-l", cwd=world.work).out
 
 
+def test_jobs_setting_is_not_a_repo(world, run):
+    world.repo("A", remote=False)
+    write(world.work / ".gitall", "jobs = 4\nA\n")
+    r = run("-l", cwd=world.work)
+    assert r.code == 0 and listed(r) == ["A"] and not r.err
+
+
 # ---- worktrees ----------------------------------------------------------------------------
 def test_linked_worktrees_are_left_out_of_automatic_discovery(world, run):
     a = world.repo("A", remote=False)

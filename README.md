@@ -36,6 +36,7 @@ go before the git command.
   [tools]                  # a group: the lines below also belong to "tools"
   scripts
   []                       # ends the group
+  jobs = 8                 # default for -j
   ```
 - `gitall -l` lists the repos it picked, with their numbers and state.
   Linked worktrees of repos in the list are left out (list them in `.gitall` to include them).
@@ -82,6 +83,7 @@ gitall -r tools -l                             # check a choice before using it
 |---|---|
 | `-y` | Don't ask for confirmation (also allowed as the last argument) |
 | `-q` | Leave out repos with nothing to report |
+| `-j N` | Run fetch/pull/push/clone, and commands that only show things, in N repos at once |
 | `--prefix` | Start each output line with the repo's path: `gitall --prefix grep -n TODO` |
 | `-C DIR` | Start in `DIR` instead of the current folder |
 | `-c name=value`, `--no-pager`, `--literal-pathspecs`, ... | git's own options, passed on to git |
@@ -141,7 +143,7 @@ gitall add -- '*.tex'                             # git pathspecs work as usual
 gitall commit -m "Weekly edits ({repo})" --dry-run
 gitall commit -am "Weekly edits" -y
 gitall commit -m "Fix slides" -- 'slides/*.tex'   # commit only matching files, in every repo
-gitall fetch                                      # then
+gitall -j 8 fetch                                 # then
 gitall -r :behind pull
 gitall -r :dirty status
 gitall switch -c feature/x                        # create a branch everywhere
