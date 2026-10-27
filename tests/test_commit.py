@@ -1,6 +1,9 @@
 """gitall commit: preview every repo, ask once, commit; skip repos that aren't safe."""
+import subprocess
+
 import pytest
 
+import gitall
 from conftest import git, write
 from helpers import PROBLEMS, make_problem
 
@@ -109,7 +112,8 @@ def test_answer_no_aborts(world, run):
     before = world.head("A")
     r = run("commit", "-m", "x", cwd=world.work, answer="n")
     assert r.code == 1
-    assert "Commit 1 repo? [y/N]" in r.out and "aborted, nothing changed" in r.out
+    # output isn't a terminal here, so the question goes where the user sees it: stderr
+    assert "Commit 1 repo? [y/N]" in r.err and "aborted, nothing changed" in r.out
     assert world.head("A") == before
 
 
@@ -158,6 +162,37 @@ def test_no_message_opens_one_editor_for_all_repos(world, run, monkeypatch):
     assert runs() == 1
     assert last_message(a) == "Edits in A"
     assert last_message(b) == "Edits in B"
+
+
+def test_question_goes_with_the_output_on_a_terminal(world, run, monkeypatch):
+    two_repos_one_staged(world)
+    monkeypatch.setattr(gitall, "TTY", True)
+    monkeypatch.setattr(gitall, "NO_COLOR", True)
+    r = run("commit", "-m", "x", cwd=world.work, answer="n")
+    assert r.code == 1 and "Commit 1 repo? [y/N]" in r.out
+
+
+def test_one_message_is_written_in_a_file_named_commit_editmsg(world, run, monkeypatch, tmp_path):
+    # vim, emacs and VS Code recognise a commit message by this exact file name
+    log = tmp_path / "editor.log"
+    monkeypatch.setenv("GIT_EDITOR", f"basename \"$1\" > '{log.as_posix()}'; echo msg >")
+    a = world.repo("A")
+    write(a / "main.tex", "changed\n")
+    r = run("commit", "-a", "-y", cwd=world.work)
+    assert r.code == 0, r
+    assert log.read_text().strip() == "COMMIT_EDITMSG" and last_message(a) == "msg"
+
+
+def test_no_editor_commits_nothing(world, run, monkeypatch):
+    for var in ("GIT_EDITOR", "VISUAL", "EDITOR"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("TERM", "dumb")  # git has no editor to fall back on: it refuses
+    a = world.repo("A")
+    write(a / "main.tex", "changed\n")
+    before = world.head("A")
+    r = run("commit", "-a", "-y", cwd=world.work)
+    assert r.code == 1 and "no editor for the commit message" in r.err, r
+    assert world.head("A") == before
 
 
 def test_empty_message_commits_nothing(world, run, monkeypatch):
@@ -250,7 +285,9 @@ def test_commit_help_is_shown_once(world, run):
     world.repo("A")
     world.repo("B")
     r = run("commit", "-h", cwd=world.work)
-    assert r.code == 129
+    git_code = subprocess.run(["git", "commit", "-h"], cwd=world.work, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode   # 129, or 0 since git 2.5x
+    assert r.code == git_code
     assert r.all.count("usage: git commit") == 1
 
 

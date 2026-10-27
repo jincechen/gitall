@@ -52,6 +52,40 @@ def test_exact_name_wins_over_substring(world, run):
     assert pick(run, world, "-r", "api-") == ["api-gateway", "api-wt"]  # no exact match: substring
 
 
+def test_name_typed_exactly_comes_first(world, run):
+    (world.root / "probe").mkdir()
+    if (world.root / "PROBE").exists():
+        pytest.skip("case-insensitive file system")
+    for name in ("Deck", "deck", "notes"):
+        world.repo(name, remote=False)
+    assert pick(run, world, "-r", "deck") == ["deck"]
+    assert pick(run, world, "-r", "Deck") == ["Deck"]
+    assert sorted(pick(run, world, "-r", "DECK")) == ["Deck", "deck"]
+    assert sorted(pick(run, world, "-x", "deck")) == ["Deck", "notes"]
+
+
+def test_repo_named_like_a_position(world, run):
+    for name in ("3", "2023-2024", "Alpha", "Beta", "Gamma"):
+        world.repo(name, remote=False)
+    assert pick(run, world, "-r", "3") == ["3"]
+    assert pick(run, world, "-r", "2023-2024") == ["2023-2024"]
+    assert pick(run, world, "-r", "4-5") == ["Beta", "Gamma"]
+
+
+def test_names_typed_composed_match_decomposed_folders(world, run):
+    world.repo("U\u0308bung", remote=False)    # how macOS lists \u00dcbung
+    world.repo("Other", remote=False)
+    for term in ("\u00dcbung", "\u00fcbung", "\u00dcb*", "\u00dcBUNG"):
+        assert pick(run, world, "-r", term) == ["U\u0308bung"], term
+
+
+def test_glob_expanded_by_the_shell(decks, run):
+    # unquoted, -r Deck* reaches gitall as -r Deck1 Deck10 Deck2 status
+    r = run("-r", "Deck1", "Deck10", "Deck2", "status", cwd=decks.work)
+    assert r.code == 2 and "'Deck10' is one of the repos, not a git command" in r.err
+    assert "Quote it: -r 'Deck*'" in r.err
+
+
 def test_positions_and_ranges(decks, run):
     # list order: Deck1 Deck2 Deck10 notes tools
     assert pick(run, decks, "-r", "2-4") == ["Deck2", "Deck10", "notes"]

@@ -45,7 +45,7 @@ def git_env(tmp_path, monkeypatch):
     home.mkdir()
     (home / ".gitconfig").write_text(GITCONFIG, encoding="utf-8")
     for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_EDITOR", "VISUAL", "EDITOR",
-                "GIT_SEQUENCE_EDITOR", "GIT_PAGER", "PAGER"):
+                "GIT_SEQUENCE_EDITOR", "GIT_PAGER", "PAGER", "GCM_INTERACTIVE", "GIT_SSH_COMMAND"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
@@ -67,7 +67,8 @@ def git(cwd, *args, check=True):
 
 def write(path, text="x\n"):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+    with path.open("w", encoding="utf-8", newline="\n") as f:     # write_text(newline=) needs 3.10
+        f.write(text)
 
 
 class World:

@@ -65,7 +65,7 @@ def test_clone_asks_first(world, run):
     assert r.code == 2 and "re-run with -y" in r.err
     assert not (world.work / "A").exists()
     r = run("clone", cwd=world.work, answer="n")
-    assert r.code == 1 and "Clone 1 repo into" in r.out
+    assert r.code == 1 and "Clone 1 repo into" in r.err
     assert not (world.work / "A").exists()
 
 

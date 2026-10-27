@@ -48,29 +48,35 @@ Other options:
 Per-repo values: {repo} {path} {branch} {upstream} {default} in the arguments become
 each repo's folder name, path, current branch, upstream and default branch (main,
 master, ...), e.g.  gitall switch {default}.  In PowerShell, quote them: '{repo}'.
+In bash and zsh, quote globs and '!': -r 'Deck*', -r ':on=feature/*', -r '!old'.
 
 Which repos: those listed in the nearest .gitall file (in the current directory or a
-parent); else every git repo directly inside the current directory; else, inside a
-repo, that repo and its siblings. A .gitall file has one entry per line: a name, a
-path or a glob ('Deck*', 'archive/*'); '!entry' leaves repos out; '[name]' starts a
-group and '[]' ends it; 'name  URL' (two spaces) lets gitall clone it; 'jobs = N' sets a
-default for -j; # starts a comment.
+parent); else every git repo directly inside the current directory (but not hidden
+.folders); else, inside a repo, that repo and its siblings. A .gitall file has one
+entry per line: a name, a path or a glob ('Deck*', 'archive/*'); '!entry' leaves repos
+out; '[name]' starts a group and '[]' ends it; 'name  URL' (two spaces) lets gitall
+clone it; 'jobs = N' sets a default for -j; # starts a comment.
 """
+import codecs
 import errno
 import fnmatch
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-PROG = Path(__file__).stem              # rename the file and messages/config name follow
-CONFIG = f".{PROG}"
+# rename the file and the messages and config file follow; a link to it (ga, or git-all for
+# "git all") gives the name used in messages, and still reads the file's own config, .gitall
+PROG = Path(__file__).stem
+CONFIG = f".{Path(__file__).resolve().stem}"
 
 # commands that only show things: no confirmation needed
 READ_ONLY = {
@@ -151,8 +157,28 @@ if os.name == "nt" and TTY:
     os.system("")  # enable ANSI colours in the Windows console
 
 
+_colour = []
+
+
+def use_colour():
+    """Whether to colour output: on a terminal, unless NO_COLOR is set or, on POSIX, git itself
+    wouldn't (color.ui=never, TERM=dumb)."""
+    if not TTY or NO_COLOR:
+        return False
+    if os.name == "nt":
+        return True
+    if not _colour:
+        try:
+            p = subprocess.run(["git", *USER_OPTS, "config", "--get-colorbool", "color.ui", "true"],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            _colour.append(p.stdout.strip() == b"true")
+        except OSError:     # no git: the message saying so still gets out
+            _colour.append(os.environ.get("TERM", "dumb") != "dumb")
+    return _colour[0]
+
+
 def _c(code):
-    return lambda t: f"\033[{code}m{t}\033[0m" if TTY and not NO_COLOR else t
+    return lambda t: f"\033[{code}m{t}\033[0m" if use_colour() else t
 
 
 BOLD, RED, GREEN, YELLOW = _c("1"), _c("31"), _c("32"), _c("33")
@@ -165,7 +191,7 @@ class PipeClosed(Exception):
 
 def _write(stream, text):
     try:
-        stream.buffer.write(text.encode("utf-8", "replace"))
+        stream.buffer.write(_bytes(text))
         stream.flush()
     except BrokenPipeError:
         raise PipeClosed from None
@@ -184,6 +210,11 @@ def err(text=""):
     _write(sys.stderr, text + "\n")
 
 
+def err_prompt(text):
+    sys.stdout.flush()
+    _write(sys.stderr, text)
+
+
 def die(msg, code=2):
     err(RED(f"{PROG}: {msg}"))
     sys.exit(code)
@@ -199,14 +230,28 @@ def header(text):
 
 
 def quote(arg):
-    """An argument as you'd type it, for messages."""
-    if arg and not re.search(r"[\s\"'$`!&|<>;(){}*?\[\]\\]", arg):
+    """An argument as you'd type it, for messages: quoted for sh/bash/zsh, or on Windows for
+    PowerShell, so that a printed command can be pasted back as is ($ and ` stay literal)."""
+    if os.name != "nt":
+        return shlex.quote(arg)
+    if arg and not re.search(r"[\s\"'$`!&|<>;(){}*?\[\]\\,@#‘-‛]", arg):
         return arg
-    return '"' + arg.replace('"', '\\"') + '"'
+    return "'" + re.sub(r"(['‘-‛])", r"\1\1", arg) + "'"
 
 
 def shown(args):
     return " ".join(quote(a) for a in args)
+
+
+def width(text):
+    """The columns text takes in a terminal: CJK characters take two; accents and other
+    zero-width characters (joiners, variation selectors) none."""
+    return sum(0 if unicodedata.category(ch) in ("Mn", "Me", "Cf")
+               else 2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+
+
+def pad(text, n):
+    return text + " " * (n - width(text))
 
 
 def plural(n, word):
@@ -226,10 +271,17 @@ def confirm(question, yes):
     if not sys.stdin.isatty():
         die("not running interactively: re-run with -y")
     try:
-        ans = input(f"{question} [y/N] ")
+        if TTY:
+            ans = input(f"{question} [y/N] ")
+        else:   # output goes to a file or a pipe: ask where the user sees it
+            err_prompt(f"{question} [y/N] ")
+            ans = input()
     except EOFError:
         out()
         die("no answer (input closed): re-run with -y", code=1)
+    except KeyboardInterrupt:
+        out()
+        raise
     if ans.strip().lower() not in ("y", "yes"):
         out("aborted, nothing changed")
         sys.exit(1)
@@ -245,20 +297,45 @@ class Res:
 
 
 def _text(b):
-    return b.decode("utf-8", "replace").rstrip("\n")
+    """Bytes from git or a file as text. On POSIX, file names and contents that aren't valid
+    UTF-8 (or are in another locale's encoding) come back out of _bytes unchanged."""
+    return (os.fsdecode(b) if os.name != "nt" else b.decode("utf-8", "replace")).rstrip("\n")
 
 
-def git(cwd, *args, live=False, colour=False, internal=False, env=None, batch=False):
+def _bytes(text):
+    if os.name != "nt":
+        try:
+            return os.fsencode(text)
+        except UnicodeEncodeError:  # a character the locale's encoding doesn't have
+            pass
+    return text.encode("utf-8", "replace")
+
+
+def decorate(cwd):
+    """Whether to ask git log for the branch names it shows only on a terminal: yes, unless
+    log.decorate is set for this repo."""
+    return subprocess.run(["git", *USER_OPTS, "config", "--get", "log.decorate"], cwd=cwd,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0
+
+
+def git(cwd, *args, live=False, terminal=False, internal=False, env=None, batch=False):
     """Run git in cwd -> Res(rc, out, err).
     internal: for gitall's own queries (plain, uncoloured output);
+    terminal: output as git shows it on a terminal (colour, log decorations), though it's piped;
     live: attached to the terminal (editors, prompts);
     batch: no prompts at all (parallel runs)."""
     if internal:
         cmd = ["git", *USER_OPTS, "-c", "core.quotePath=false", "-c", "color.ui=never"]
     else:
         cmd = ["git", "-c", "core.quotePath=false"]
-        if colour and TTY and not NO_COLOR:
+        if terminal and use_colour():
             cmd += ["-c", "color.ui=always"]
+        if terminal and TTY and args[:1] in (("log",), ("show",), ("whatchanged",), ("reflog",)) \
+                and decorate(cwd):
+            cmd += ["-c", "log.decorate=short"]
+        if terminal and TTY and not live and "COLUMNS" not in (env or os.environ):
+            # git writes to a pipe here: tell it the terminal's width (diff --stat, ...)
+            env = dict(env or os.environ, COLUMNS=str(shutil.get_terminal_size().columns))
         cmd += USER_OPTS
     cmd += ["--no-pager", *args]
     if live:
@@ -271,6 +348,27 @@ def git(cwd, *args, live=False, colour=False, internal=False, env=None, batch=Fa
 def git_ok(cwd, *args):
     r = git(cwd, *args, internal=True)
     return r.out if r.rc == 0 else None
+
+
+MIN_GIT = (2, 15)
+_git_version = []
+
+
+def git_version():
+    """('git version 2.39.5 (Apple Git-154)', (2, 39)), asked once; only when needed."""
+    if not _git_version:
+        p = subprocess.run(["git", "version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        text = _text(p.stdout).strip()
+        m = re.search(r"(\d+)\.(\d+)", text)
+        _git_version.append((text, (int(m.group(1)), int(m.group(2))) if m else (99, 0)))
+    return _git_version[0]
+
+
+def check_git_version():
+    """After a git status failed: stop if that's because git is too old for gitall."""
+    text, version = git_version()
+    if version < MIN_GIT:
+        die(f"{PROG} needs git {MIN_GIT[0]}.{MIN_GIT[1]} or newer; this is {text}")
 
 
 def first_error(res):
@@ -298,7 +396,10 @@ def find_sh():
 
 def run_editor(path, cwd):
     """Open git's editor on path, the way git does. True if it exited cleanly."""
-    editor = git_ok(cwd, "var", "GIT_EDITOR") or "vi"
+    editor = git_ok(cwd, "var", "GIT_EDITOR")
+    if not editor:  # git refuses too: nothing set and a dumb terminal
+        die("no editor for the commit message (set GIT_EDITOR or EDITOR, or give it with -m): "
+            "nothing committed", 1)
     sh = find_sh()
     if sh:
         return subprocess.call([sh, "-c", f'{editor} "$@"', editor, path.as_posix()], cwd=cwd) == 0
@@ -307,15 +408,33 @@ def run_editor(path, cwd):
 
 # ---- repos ---------------------------------------------------------------------------
 def natural(name):
-    return [int(s) if s.isdigit() else s.lower() for s in re.split(r"(\d+)", name)]
+    # [0-9], not \d: '²' and '①' count as digits but int() refuses them
+    return [int(s) if i % 2 else s.lower() for i, s in enumerate(re.split(r"([0-9]+)", name))]
 
 
 def key(path):
+    """What makes two paths the same folder. On POSIX that's the folder itself, however the
+    path spells it (symlinks; case and Unicode form on macOS); on Windows the normalized path."""
+    if os.name != "nt":
+        try:
+            st = os.stat(path)
+            return st.st_dev, st.st_ino
+        except OSError:
+            pass
     return os.path.normcase(os.path.abspath(path))
 
 
+def fold(name):
+    """A name for comparing: any case, and composed or decomposed accents (macOS lists names
+    decomposed, people type them composed)."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
 def is_repo(p):
-    return p.is_dir() and (p / ".git").exists()
+    try:
+        return p.is_dir() and (p / ".git").exists()
+    except OSError:     # a folder we may not look into (lost+found, chmod 000)
+        return False
 
 
 def git_dir(path):
@@ -323,7 +442,7 @@ def git_dir(path):
     if g.is_dir():
         return g
     try:
-        text = g.read_text(encoding="utf-8").strip()
+        text = _text(g.read_bytes()).strip()
     except OSError:
         return None
     if text.startswith("gitdir:"):
@@ -374,6 +493,7 @@ class State:
                   *(["--", *pathspec] if pathspec else []), internal=True)
         if res.rc:
             self.error = first_error(res)
+            check_git_version()
             return
         for line in res.out.splitlines():
             if line.startswith("# "):
@@ -406,6 +526,12 @@ class State:
             elif line.startswith("? "):
                 self.untracked += 1
                 self.files.append(f"?? {line[2:]}")
+        if not self.stash and gd:   # git before 2.35 doesn't report stashes: count stash's reflog
+            common = gd.parent.parent if gd.parent.name == "worktrees" else gd
+            try:
+                self.stash = len((common / "logs" / "refs" / "stash").read_bytes().splitlines())
+            except OSError:
+                pass
 
     @property
     def dirty(self):
@@ -530,39 +656,72 @@ def find_workspace(start):
         if (d / CONFIG).is_file():
             return read_config(d, d / CONFIG)
     ws = Workspace(start)
-    found = [p for p in subdirs(start) if is_repo(p)]
+    here = {key(d) for d in [start, *start.parents]}
+
+    def repos_in(d):    # hidden folders (~/.oh-my-zsh) only when you're in one, like * in .gitall
+        return [p for p in subdirs(d) if is_repo(p) and (not p.name.startswith(".") or key(p) in here)]
+    found = repos_in(start)
     if not found:
-        top = git_ok(start, "rev-parse", "--show-toplevel")
-        if top:
-            ws.root = Path(top).resolve().parent
-            found = [p for p in subdirs(ws.root) if is_repo(p)]
-    keys, here = {key(p) for p in found}, key(start)
+        res = git(start, "rev-parse", "--show-toplevel", internal=True,
+                  env=dict(os.environ, LC_ALL="C"))     # its "not a git repository" untranslated
+        if res.rc == 0 and res.out:
+            ws.root = Path(res.out).resolve().parent
+            found = repos_in(ws.root)
+        elif res.rc and "not a git repository" not in res.err:
+            die(first_error(res))       # e.g. an option this git doesn't know, dubious ownership
+    keys = {key(p) for p in found}
+    first = {}
+    for p in sorted(found, key=lambda p: p.is_symlink()):  # a link loses to the folder itself
+        first.setdefault(key(p), p)
     for p in found:
         main = worktree_of(p)
-        inside = here == key(p) or here.startswith(key(p) + os.sep)
-        if main is not None and key(main) in keys and not inside:
+        if first[key(p)] != p:
+            ws.hidden.append(f"{p.name} (same repo as {first[key(p)].name})")
+        elif main is not None and key(main) in keys and key(p) not in here:
             ws.hidden.append(f"{p.name} (worktree of {main.name})")
         else:
             ws.repos.append(Repo(p, ws.root))
     return ws
 
 
-def config_entry(root, entry):
-    """The repos an entry of .gitall names: a name, a path, or globs per path part."""
+def config_entry(root, entry, listings):
+    """The repos an entry of .gitall names: a name, a path, or globs per path part. Names come
+    out spelled as on disk, also when the entry differs in case or in Unicode form."""
+    def listing(d):
+        if d not in listings:
+            listings[d] = subdirs(d)
+        return listings[d]
+
+    def on_disk(d, name):
+        names = [c.name for c in listing(d)]
+        if name not in names:
+            same = [n for n in names if fold(n) == fold(name)]
+            name = same[0] if len(same) == 1 else name
+        return d / name
+
     paths = [root]
     for part in entry.split("/"):
         if any(ch in part for ch in GLOB_CHARS):
-            paths = [c for d in paths for c in subdirs(d) if fnmatch.fnmatchcase(c.name, part)
+            pattern = unicodedata.normalize("NFC", part)
+            paths = [c for d in paths for c in listing(d)
+                     if fnmatch.fnmatchcase(unicodedata.normalize("NFC", c.name), pattern)
                      and (part.startswith(".") or not c.name.startswith("."))]
-        else:
+        elif part in ("", ".", ".."):
             paths = [d / part for d in paths]
+        else:
+            paths = [on_disk(d, part) for d in paths]
     return [p for p in paths if is_repo(p)]
 
 
 def read_config(root, cfg):
     ws = Workspace(root, cfg)
-    known, excluded, group = {}, set(), None
-    for n, raw in enumerate(cfg.read_text(encoding="utf-8-sig").splitlines(), 1):
+    known, excluded, group, listings = {}, set(), None, {}
+    try:
+        data = cfg.read_bytes()
+    except OSError as e:
+        die(f"can't read {cfg}: {e.strerror}")
+    lines = _text(data[3:] if data.startswith(codecs.BOM_UTF8) else data).splitlines()
+    for n, raw in enumerate(lines, 1):
         line = re.sub(r"(^|\s)#.*", "", raw).strip()    # '#' starts a comment, 'C#' doesn't
         if not line:
             continue
@@ -570,7 +729,7 @@ def read_config(root, cfg):
         if m:
             group = m.group(1) or None                    # [] ends the group
             if group:
-                ws.groups.setdefault(group.lower(), (group, []))
+                ws.groups.setdefault(fold(group), (group, []))
             continue
         m = re.fullmatch(r"jobs\s*=\s*(\d+)", line)
         if m:
@@ -584,7 +743,7 @@ def read_config(root, cfg):
                 (re.match(r"\S+://|[\w.-]+@[\w.-]+:", m.group(3)) or len(m.group(2)) > 1 or "\t" in m.group(2)):
             entry, url = m.group(1), m.group(3)
         entry = entry.replace("\\", "/").rstrip("/")
-        hits = config_entry(root, entry)
+        hits = config_entry(root, entry, listings)
         if exclude:
             excluded |= {key(p) for p in hits}
             continue
@@ -600,8 +759,8 @@ def read_config(root, cfg):
                 r = known[key(p)] = Repo(p, root)
                 ws.repos.append(r)
             r.url = url or r.url
-            if group and r not in ws.groups[group.lower()][1]:
-                ws.groups[group.lower()][1].append(r)
+            if group and r not in ws.groups[fold(group)][1]:
+                ws.groups[fold(group)][1].append(r)
     ws.repos = [r for r in ws.repos if key(r.path) not in excluded]
     for g, (name, members) in ws.groups.items():
         ws.groups[g] = (name, [r for r in members if key(r.path) not in excluded])
@@ -639,21 +798,25 @@ def state_test(term):
 
 
 def match_term(ws, term):
-    """The repos a name, glob, position, range or group stands for."""
-    t, repos = term.lower(), ws.repos
+    """The repos a group, name, position, range or glob stands for. A name typed exactly comes
+    first (Deck and deck are two repos on Linux; a repo may be called 3), then any case."""
+    t, repos = fold(term), ws.repos
+    if t in ws.groups:
+        return ws.groups[t][1]
+    exact = [r for r in repos if term in (r.name, r.folder)]
+    if exact:
+        return exact
     m = re.fullmatch(r"(\d+)(?:-(\d+))?", term)
     if m:
         lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
         return repos[lo - 1:hi] if 1 <= lo <= hi <= len(repos) else []
-    if t in ws.groups:
-        return ws.groups[t][1]
-    exact = [r for r in repos if t in (r.name.lower(), r.folder.lower())]
+    exact = [r for r in repos if t in (fold(r.name), fold(r.folder))]
     if exact:
         return exact
     if any(ch in t for ch in GLOB_CHARS):
-        return [r for r in repos if fnmatch.fnmatchcase(r.name.lower(), t)
-                or fnmatch.fnmatchcase(r.folder.lower(), t)]
-    return [r for r in repos if t in r.name.lower()]
+        return [r for r in repos if fnmatch.fnmatchcase(fold(r.name), t)
+                or fnmatch.fnmatchcase(fold(r.folder), t)]
+    return [r for r in repos if t in fold(r.name)]
 
 
 def no_match(ws, term):
@@ -664,16 +827,20 @@ def no_match(ws, term):
 
 def select(ws, picks, drops):
     """The repos chosen by -r (picks) and -x (drops), in list order."""
+    def terms(spec):    # a repo with a comma in its name ("Smith, Jones") is one term, not two
+        if any(spec.strip().lstrip("!") in (r.name, r.folder) for r in ws.repos):
+            return [spec.strip()]
+        return [t.strip() for t in spec.split(",")]
     names, states, excluded = [], [], []
     for spec in picks:
-        for term in (t.strip() for t in spec.split(",")):
+        for term in terms(spec):
             if term.startswith("!"):
                 excluded.append(term[1:])
             elif term.startswith(":"):
                 states.append(state_test(term[1:]))
             elif term:
                 names.append(term)
-    excluded += [t.strip().lstrip("!") for spec in drops for t in spec.split(",") if t.strip()]
+    excluded += [t.lstrip("!") for spec in drops for t in terms(spec) if t]
     chosen = ws.repos
     if names:
         hits = set()
@@ -965,15 +1132,19 @@ class Blocks:
         if not o and not e:
             return
         self.printed = True
+        nul = res.out.endswith("\0")       # -z: NUL-terminated records, not lines (grep -z ends in \n)
         if self.prefix_from is not None:
             pre = os.path.relpath(repo.path, self.prefix_from).replace(os.sep, "/")
             pre = "" if pre == "." else pre + "/"
-            for ln in o:
-                out(pre + ln)
+            if nul:
+                _write(sys.stdout, "".join(f"{pre}{rec}\0" for rec in res.out.split("\0") if rec))
+            else:
+                for ln in o:
+                    out(pre + ln)
             for ln in e:
                 err(f"{repo.name}: {ln}")
             return
-        if not self.streaming and (len(o) == 1 or (not o and len(e) == 1)):
+        if not self.streaming and not nul and (len(o) == 1 or (not o and len(e) == 1)):
             # one line of output (git's warnings on stderr don't count): a row
             self.pending += [(repo, True, ln) for ln in o] + [(repo, False, ln) for ln in e]
             return
@@ -994,9 +1165,9 @@ class Blocks:
     def close(self):
         if self.streaming:
             return self.flush()
-        width = max((len(r.name) for r, _, _ in self.pending), default=0)
+        w = max((width(r.name) for r, _, _ in self.pending), default=0)
         for repo, to_out, line in self.pending:
-            (out if to_out else err)(f"{BOLD(repo.name.ljust(width))}  {line}")
+            (out if to_out else err)(f"{BOLD(pad(repo.name, w))}  {line}")
         self.pending = []
 
 
@@ -1031,17 +1202,17 @@ def branch_text(s):
     return s.branch + (" (no commits)" if s.unborn else "")
 
 
-def repo_row(repo, width, bwidth, changes=True):
+def repo_row(repo, w, bw, changes=True):
     s = repo.state
     rest = "  ".join(t for t in (sync_text(s), change_text(s) if changes else "") if t)
-    return f"{repo.name:<{width}}  {branch_text(s):<{bwidth}}  {rest or GREEN('clean')}".rstrip()
+    return f"{pad(repo.name, w)}  {pad(branch_text(s), bw)}  {rest or GREEN('clean')}".rstrip()
 
 
 class Run:
     def __init__(self, ws, repos, o, gitcmd):
         self.ws, self.repos, self.o, self.gitcmd = ws, repos, o, gitcmd
         self.failed, self.skipped, self.tally, self.code = [], [], {}, 0
-        self.width = max((len(r.name) for r in repos), default=0)
+        self.width = max((width(r.name) for r in repos), default=0)
 
     # -- bookkeeping
     def skip(self, repo, why):
@@ -1089,16 +1260,18 @@ class Run:
 
     def command_line(self, repos, argv):
         where = ["-C", quote(str(self.o.start))] if key(self.o.start) != key(Path.cwd()) else []
-        return " ".join([PROG, *where, "-r", quote(",".join(r.name for r in repos)),
+        if any("," in r.name for r in repos):   # -r splits a list at commas: one -r per repo
+            chosen = [a for r in repos for a in ("-r", quote(r.name))]
+        else:
+            chosen = ["-r", quote(",".join(r.name for r in repos))]
+        return " ".join([PROG, *where, *chosen,
                          *(quote(a) for a in USER_OPTS), *(quote(a) for a in argv)])
 
     def env(self, repo, batch=False):
         e = dict(os.environ, GITALL_REPO=repo.folder, GITALL_PATH=str(repo.path),
                  GITALL_ROOT=str(self.ws.root), GITALL_COUNT=str(len(self.repos)),
                  GITALL_I=str(self.repos.index(repo) + 1 if repo in self.repos else 0))
-        if batch:
-            e.update(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
-        return e
+        return no_prompts(e, repo.path) if batch else e
 
     def each(self, repos, work, parallel=True):
         """Yield (repo, work(repo, batch)) in list order; with -j N, N at a time.
@@ -1111,13 +1284,18 @@ class Run:
         retry = []
         with ThreadPoolExecutor(jobs) as ex:
             futures = [(r, ex.submit(work, r, True)) for r in repos]
-            for r, f in futures:
-                res = f.result()
-                first = res[0] if isinstance(res, tuple) else res
-                if first.rc and AUTH_FAILED.search(first.err):
-                    retry.append(r)
-                    continue
-                yield r, res
+            try:
+                for r, f in futures:
+                    res = f.result()
+                    first = res[0] if isinstance(res, tuple) else res
+                    if first.rc and AUTH_FAILED.search(first.err):
+                        retry.append(r)
+                        continue
+                    yield r, res
+            except BaseException:       # Ctrl-C or a closed pipe: start no more repos
+                for _, f in futures:
+                    f.cancel()
+                raise
         if retry:
             out()
             out(f"retrying {plural(len(retry), 'repo')} one at a time (may ask for a password): "
@@ -1154,7 +1332,7 @@ class Run:
                 for r, s in zip(self.repos, ex.map(lambda r: State(r.path, paths), self.repos)):
                     r._state = s
         load_states(self.repos)
-        bwidth = min(30, max(len(branch_text(r.state)) for r in self.repos))
+        bwidth = min(30, max(width(branch_text(r.state)) for r in self.repos))
         details = []
         for r in self.repos:
             s = r.state
@@ -1258,10 +1436,12 @@ class Run:
             todo = [(r, rargs) for r, rargs in todo if r in messages]
         for r, rargs in todo:
             if one_editor:
-                with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as f:
-                    f.write(messages[r])
-                res = git(r.path, "commit", "-q", "-F", f.name, *rargs, env=self.env(r))
-                os.unlink(f.name)
+                with tempfile.NamedTemporaryFile("wb", suffix=".txt", delete=False) as f:
+                    f.write(_bytes(messages[r]))
+                try:
+                    res = git(r.path, "commit", "-q", "-F", f.name, *rargs, env=self.env(r))
+                finally:
+                    os.unlink(f.name)
             elif repo_editor or live_commit:
                 header(r.name)
                 res = git(r.path, "commit", *rargs, live=True, env=self.env(r))
@@ -1286,14 +1466,14 @@ class Run:
         for r, files in previews:
             lines.append(f"# {r.name}:")
             lines += [f"#   {ln}" for ln in files[:STATUS_FILES]]
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".COMMIT_EDITMSG", delete=False) as f:
-            f.write("\n".join(lines) + "\n")
-        path = Path(f.name)
+        folder = Path(tempfile.mkdtemp(prefix=f"{PROG}-"))
+        path = folder / "COMMIT_EDITMSG"    # the name editors know as a commit message
         try:
+            path.write_bytes(_bytes("\n".join(lines) + "\n"))
             ok = run_editor(path, self.o.start)
-            text = path.read_text(encoding="utf-8")
+            text = _text(path.read_bytes())
         finally:
-            path.unlink()
+            shutil.rmtree(folder, ignore_errors=True)
         message = "\n".join(ln.rstrip() for ln in text.splitlines() if not ln.startswith("#")).strip()
         if not ok or not message:
             die("no commit message (the editor failed or the message was empty): nothing committed", 1)
@@ -1317,7 +1497,8 @@ class Run:
                     continue
                 if not s.tracking:
                     if setup is None:
-                        setup = git_ok(r.path, "config", "--type=bool", "push.autoSetupRemote") == "true"
+                        setup = git_ok(r.path, "config", "--type=bool", "push.autoSetupRemote") == "true" \
+                            and git_version()[1] >= (2, 37)     # older git ignores the setting
                     if s.upstream or not setup:
                         why = "its upstream branch is gone" if s.upstream else "no upstream branch"
                         self.skip(r, f"{why} (to publish it: {PROG} -r {quote(r.name)} push -u origin HEAD)")
@@ -1402,7 +1583,7 @@ class Run:
                 uptodate.append(r.name)
                 self.count("up to date", r)
             elif res.rc == 0:
-                out(f"{r.name:<{self.width}}  {GREEN(change)}")
+                out(f"{pad(r.name, self.width)}  {GREEN(change)}")
                 self.count("updated", r)
             else:
                 header(r.name)
@@ -1422,7 +1603,7 @@ class Run:
     def fetch(self, args):
         todo = self.plan(args, check=False)
         rargs_of = dict(todo)
-        bwidth = min(30, max(len(branch_text(r.state)) for r in load_states(self.repos)))
+        bwidth = min(30, max(width(branch_text(r.state)) for r in load_states(self.repos)))
 
         def work(r, batch):
             res = git(r.path, "fetch", *rargs_of[r], env=self.env(r, batch), batch=batch)
@@ -1493,7 +1674,7 @@ class Run:
             res = git(r.path, cmd, *rargs, env=self.env(r))
             if res.rc == 0:
                 r.refresh()
-                out(f"{r.name:<{self.width}}  {GREEN('on')} {r.state.branch or branch_text(r.state)}")
+                out(f"{pad(r.name, self.width)}  {GREEN('on')} {r.state.branch or branch_text(r.state)}")
                 self.count("switched", r)
             else:
                 header(r.name)
@@ -1514,7 +1695,7 @@ class Run:
         url_of = {r.name: url for r, (_, url) in zip(targets, self.ws.missing)}
 
         def work(r, batch):
-            env = dict(os.environ, **({"GIT_TERMINAL_PROMPT": "0"} if batch else {}))
+            env = no_prompts(dict(os.environ), self.ws.root) if batch else None
             return git(self.ws.root, "clone", url_of[r.name], r.name, env=env, batch=batch)
         for r, res in self.each(targets, work):
             if res.rc == 0:
@@ -1555,7 +1736,7 @@ class Run:
             self.finish()
 
         def work(r, batch):
-            return git(r.path, cmd, *rargs_of[r], colour=not self.o.prefix, env=self.env(r, batch), batch=batch)
+            return git(r.path, cmd, *rargs_of[r], terminal=not self.o.prefix, env=self.env(r, batch), batch=batch)
         for r, res in self.each([r for r, _ in todo], work, parallel=shows):
             blocks.add(r, res)
             # exit 1 from grep / diff --exit-code means "no match" / "has differences", not failure
@@ -1573,6 +1754,16 @@ class Run:
         if not blocks.printed and not self.o.quiet and "--quiet" not in args and not self.o.prefix:
             out("(no output)" if shows else f"done in {plural(len(todo), 'repo')}")
         self.finish()
+
+
+def no_prompts(env, cwd):
+    """env for git running in parallel with others: it fails instead of asking for a password,
+    and the repo is then retried on its own (see Run.each). ssh asks on the terminal itself,
+    so it gets BatchMode, unless you set up your own ssh command."""
+    env.update(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+    if not {"GIT_SSH_COMMAND", "GIT_SSH"} & env.keys() and git_ok(cwd, "config", "core.sshCommand") is None:
+        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+    return env
 
 
 def describe_change(path, before, after):
@@ -1615,10 +1806,10 @@ def list_repos(ws, chosen, picked):
     total = f"{len(chosen)} of {len(ws.repos)}" if picked else f"{len(ws.repos)}"
     out(f"{total} repo(s) {where}")
     if chosen:
-        width = max(len(r.name) for r in chosen)
-        bwidth = min(30, max(len(branch_text(r.state)) for r in chosen))
+        w = max(width(r.name) for r in chosen)
+        bw = min(30, max(width(branch_text(r.state)) for r in chosen))
         for r in chosen:
-            out(f"{ws.repos.index(r) + 1:3}  {repo_row(r, width, bwidth)}")
+            out(f"{ws.repos.index(r) + 1:3}  {repo_row(r, w, bw)}")
     if ws.groups:
         out("groups: " + ", ".join(f"{name} ({len(rs)})" for name, rs in ws.groups.values()))
     if ws.missing:
@@ -1635,10 +1826,12 @@ class Options:
 
 
 def usage():
-    return __doc__.strip().replace("gitall", PROG).replace(".gitall", CONFIG)
+    return __doc__.strip().replace(".gitall", "\0").replace("gitall", PROG).replace("\0", CONFIG)
 
 
 def main(argv):
+    if not shutil.which("git"):
+        die("git isn't installed, or isn't on your PATH")
     o, i = Options(), 0
     USER_OPTS.clear()
     with_value = {"-r": "picks", "--repo": "picks", "-x": "drops", "--exclude": "drops",
@@ -1735,6 +1928,12 @@ def main(argv):
         hint = f"; {PROG} clone gets the ones listed in {ws.config}" if ws.missing else \
             f" (run it in or inside the folder that contains your repos, or list them in a {CONFIG} file)"
         die(f"no git repos found in {ws.root}{hint}")
+    if (o.picks or o.drops) and kind == "git" and cmd not in COMMON and \
+            any(cmd in (r.name, r.folder) for r in ws.repos) and \
+            cmd not in (git_ok(o.start, "--list-cmds=main,others,nohelpers") or cmd).split():
+        # sh/bash/zsh turned  -r Deck*  into  -r Deck1 Deck2 Deck3: the second repo became the command
+        die(f"'{cmd}' is one of the repos, not a git command: did the shell expand a glob? "
+            f"Quote it: -r 'Deck*'")
     repos = select(ws, o.picks, o.drops)
     if o.list:
         return list_repos(ws, repos, bool(o.picks or o.drops))
@@ -1758,6 +1957,9 @@ if __name__ == "__main__":
     try:
         code = main(sys.argv[1:])
     except KeyboardInterrupt:
+        if os.name != "nt":     # end the way git does, killed by SIGINT, so a calling loop stops too
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGINT)
         code = 130
     except PipeClosed:
         try:

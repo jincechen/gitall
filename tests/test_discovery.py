@@ -1,5 +1,8 @@
 """Which repos gitall picks: .gitall file, repos in the folder, or the repo and its siblings."""
+import os
 import re
+
+import pytest
 
 from conftest import write
 
@@ -22,6 +25,28 @@ def test_repos_in_folder_sorted_naturally(world, run):
     assert r.code == 0
     assert listed(r) == ["deck1", "Deck2", "Deck10"]
     assert r.out.startswith(f"3 repo(s) in {world.work}")
+
+
+def test_folder_names_with_other_digits(world, run):
+    # '²' and '①' are digits to str.isdigit() but not to int(): sorting used to crash
+    world.repo("Deck2", remote=False)
+    for name in ("Kapitel 1²", "①"):
+        (world.work / name).mkdir()
+    assert listed(run("-l", cwd=world.work)) == ["Deck2"]
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions, not as root")
+def test_folder_that_cannot_be_opened_is_ignored(world, run):
+    world.repo("A", remote=False)
+    locked = world.work / "lost+found"
+    locked.mkdir()
+    locked.chmod(0)
+    try:
+        r = run("-l", cwd=world.work)
+    finally:
+        locked.chmod(0o755)
+    assert r.code == 0, r
+    assert listed(r) == ["A"]
 
 
 def test_list_rows_show_position_branch_and_state(world, run):
@@ -106,6 +131,14 @@ def test_gitall_file_glob_matching_nothing(world, run):
     assert "no git repos found" in r.err
 
 
+def test_hidden_folders_are_left_out_unless_you_are_in_one(world, run):
+    # running gitall in ~ shouldn't pick up ~/.oh-my-zsh; a * in .gitall leaves them out too
+    world.repo("A", remote=False)
+    hidden = world.repo(".dotfiles", remote=False)
+    assert listed(run("-l", cwd=world.work)) == ["A"]
+    assert listed(run("-l", cwd=hidden)) == [".dotfiles", "A"]
+
+
 def test_gitall_file_repo_matched_twice_is_listed_once(world, run):
     for name in ("A1", "A2", "B"):
         world.repo(name, remote=False)
@@ -113,10 +146,37 @@ def test_gitall_file_repo_matched_twice_is_listed_once(world, run):
     assert listed(run("-l", cwd=world.work)) == ["A2", "A1", "B"]
 
 
+def test_gitall_file_entry_in_another_case_or_unicode_form(world, run):
+    # macOS and Windows find 'deck1' for the folder Deck1; macOS lists accents decomposed
+    for name in ("Deck1", "Deck2", "U\u0308bung"):
+        world.repo(name, remote=False)
+    write(world.work / ".gitall", "deck1\n\u00dcbung\n")
+    assert listed(run("-l", cwd=world.work)) == ["Deck1", "U\u0308bung"]
+    write(world.work / ".gitall", "Deck*\n!deck1\n")
+    assert listed(run("-l", cwd=world.work)) == ["Deck2"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks")
+def test_link_to_a_repo_is_not_a_second_repo(world, run):
+    world.repo("Deck1", remote=False)
+    (world.work / "current").symlink_to("Deck1")
+    r = run("-l", cwd=world.work)
+    assert listed(r) == ["Deck1"] and "left out: current (same repo as Deck1)" in r.out
+
+
 def test_no_repos_found(world, run):
     r = run("status", cwd=world.work)
     assert r.code == 2
     assert "no git repos found" in r.err
+
+
+def test_git_error_finding_the_repo_is_shown(world, run, monkeypatch):
+    # e.g. a git option this git doesn't know, or "dubious ownership": not "no git repos found"
+    sub = world.repo("A", remote=False) / "sub"
+    sub.mkdir()
+    monkeypatch.delenv("GITALL_NOPE", raising=False)
+    r = run("--config-env=foo.bar=GITALL_NOPE", "-l", cwd=sub)
+    assert r.code == 2 and "GITALL_NOPE" in r.err and "no git repos found" not in r.err
 
 
 def test_dash_C_starts_in_another_folder(world, run):

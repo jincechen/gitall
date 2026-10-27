@@ -3,6 +3,9 @@ import os
 import re
 import time
 
+import pytest
+
+import gitall
 from conftest import git, write
 from helpers import make_problem
 
@@ -85,6 +88,38 @@ def test_stash_count(world, run):
     write(a / "main.tex", "two\n")
     git(a, "stash", "-q")
     assert run("status", cwd=world.work).out.strip() == "A  main  2 stashed"
+
+
+def test_stash_count_from_git_before_2_35(world, run, monkeypatch):
+    # older git accepts --show-stash but prints no "# stash N" line in porcelain v2
+    def old_git(cwd, *args, **kw):
+        res = real_git(cwd, *args, **kw)
+        if "status" in args:
+            res.out = "\n".join(ln for ln in res.out.splitlines() if not ln.startswith("# stash"))
+        return res
+    real_git = gitall.git
+    monkeypatch.setattr(gitall, "git", old_git)
+    a = world.repo("A")
+    for text in ("one\n", "two\n"):
+        write(a / "main.tex", text)
+        git(a, "stash", "-q")
+    assert run("status", cwd=world.work).out.strip() == "A  main  2 stashed"
+    git(a, "stash", "drop", "-q")
+    git(a, "stash", "drop", "-q")
+    assert run("status", cwd=world.work).out.strip() == "A  main  clean"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a fake git as a shell script")
+def test_git_too_old(world, run, monkeypatch, tmp_path):
+    world.repo("A", remote=False)
+    fake = tmp_path / "oldgit" / "git"
+    write(fake, '#!/bin/sh\nif [ "$*" = version ]; then echo "git version 2.14.6"; exit 0; fi\n'
+                "echo \"error: unknown option \\`no-optional-locks'\" >&2; exit 129\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake.parent}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(gitall, "_git_version", [])
+    r = run("status", cwd=world.work)
+    assert r.code == 2 and "gitall needs git 2.15 or newer; this is git version 2.14.6" in r.err
 
 
 def test_long_file_lists_are_capped(world, run):

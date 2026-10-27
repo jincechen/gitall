@@ -1,7 +1,15 @@
 """Every other git command: run in each repo, quiet repos left out, changes confirmed first."""
+import os
+import shlex
+import shutil
+import subprocess
 import zipfile
 
+import pytest
+
+import gitall
 from conftest import git, write
+from gitall import quote, width
 from helpers import make_problem
 
 
@@ -82,6 +90,46 @@ def test_prefix_with_grep(world, run):
     world.repo("B")
     r = run("--prefix", "grep", "-n", "TODO", cwd=world.work)
     assert r.out.strip() == "A/main.tex:1:TODO here"
+
+
+def test_nul_separated_output(world, run):
+    for name in ("A", "B"):
+        world.repo(name, {"x.tex": "x\n", "y.tex": "y\n"}, remote=False)
+    r = run("--prefix", "ls-files", "-z", cwd=world.work)
+    assert r.out.split("\0") == ["A/x.tex", "A/y.tex", "B/x.tex", "B/y.tex", ""]
+    r = run("-r", "A", "ls-files", "-z", cwd=world.work)
+    assert "A  x.tex" not in r.out and "x.tex\0y.tex" in r.out
+    write(world.work / "A" / "x.tex", "TODO\n")
+    r = run("--prefix", "grep", "-z", "-n", "TODO", cwd=world.work)   # NUL after the file name only
+    assert r.out == "A/x.tex\x001\x00TODO\n"
+
+
+def test_rows_line_up_for_wide_and_accented_names(world, run):
+    for name in ("Deck", "\u6570\u5b66", "U\u0308bung"):    # CJK takes two columns, the accent none
+        world.repo(name, remote=False)
+    for argv in (["-l"], ["rev-parse", "--abbrev-ref", "HEAD"]):
+        lines = [ln for ln in run(*argv, cwd=world.work).out.splitlines() if "main" in ln]
+        assert len(lines) == 3 and len({width(ln[:ln.index("main")]) for ln in lines}) == 1, lines
+    assert width("\U0001f44d\ufe0f") == 2 and width("a\u200db") == 2  # emoji + selector; joiner
+
+
+def test_on_a_terminal_git_output_looks_as_in_git(world, run, monkeypatch):
+    # git writes to a pipe here, so it would drop log's branch names and use 80 columns
+    a = world.repo("A")
+    monkeypatch.setattr(gitall, "TTY", True)
+    monkeypatch.setattr(gitall, "NO_COLOR", True)
+    assert "(HEAD -> main, origin/main)" in run("log", "-1", "--oneline", cwd=world.work).out
+    r = run("-c", "log.decorate=no", "log", "-1", "--oneline", cwd=world.work)
+    assert "HEAD" not in r.out
+    git(a, "config", "log.decorate", "no")      # set in the repo itself
+    assert "HEAD" not in run("log", "-1", "--oneline", cwd=world.work).out
+    long = "chapter-three/figures-and-tables/supplementary-figures-and-tables-for-the-appendix.tex"
+    write(a / long)
+    git(a, "add", "-A")
+    monkeypatch.setenv("COLUMNS", "")
+    monkeypatch.delenv("COLUMNS")
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((200, 40)))
+    assert long in run("diff", "--cached", "--stat", cwd=world.work).out
 
 
 def test_non_ascii_filenames_are_not_quoted(world, run):
@@ -188,6 +236,46 @@ def test_one_failure_does_not_stop_the_others(world, run):
     assert shown_repos(r)[:1] == ["B"]
     assert "Failed:\n  A: git rev-parse exited with 1" in r.out
     assert "retry:  gitall -r A rev-parse --verify -q feature" in r.out
+
+
+def retry_line(result):
+    return next(ln for ln in result.out.splitlines() if "retry:" in ln).split("retry:", 1)[1].strip()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="sh quoting")
+def test_retry_line_pastes_back_into_sh_unchanged(world, run):
+    # a LaTeX-style argument: in "..." the shell would expand $x and run `...`
+    world.repo("A")
+    arg = "Fix $x^2$ and `\\cite{k}`: it's done! #3 ~me \\\\"
+    r = run("rev-parse", "--verify", "-q", arg, cwd=world.work)
+    line = retry_line(r)
+    assert shlex.split(line) == ["gitall", "-r", "A", "rev-parse", "--verify", "-q", arg]
+    p = subprocess.run(["sh", "-c", "printf '%s\\0' " + line], stdout=subprocess.PIPE)
+    assert p.stdout.decode("utf-8").split("\0")[-2] == arg
+
+
+def test_commands_are_quoted_for_powershell_on_windows(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setattr(os, "name", "nt")
+        assert quote("Deck2") == "Deck2"
+        assert quote("Fix $x$ `a` it's") == "'Fix $x$ `a` it''s'"
+        assert quote("a,b") == "'a,b'" and quote("@x") == "'@x'" and quote("") == "''"
+
+
+def test_names_with_a_comma(world, run):
+    for name in ("Deck", "v2", "Deck, v2", "Smith, Jones"):
+        world.repo(name, remote=False)
+    r = run("-r", "Deck, v2", "-l", cwd=world.work)     # the whole name, not Deck and v2
+    assert r.out.startswith("1 of 4 repo(s)") and "Deck, v2" in r.out
+    r = run("-x", "Deck, v2", "-l", cwd=world.work)
+    assert r.out.startswith("3 of 4 repo(s)") and "Deck, v2" not in r.out
+    for name in ("Deck", "v2"):
+        git(world.work / name, "branch", "feature")
+    r = run("rev-parse", "--verify", "-q", "feature", cwd=world.work)
+    if os.name != "nt":   # one -r each, as a comma would split the name
+        assert shlex.split(retry_line(r))[:5] == ["gitall", "-r", "Deck, v2", "-r", "Smith, Jones"]
+    r = run("-r", "Deck, v2", "-r", "Smith, Jones", "-l", cwd=world.work)
+    assert r.out.startswith("2 of 4 repo(s)") and "Deck, v2" in r.out and "Smith, Jones" in r.out
 
 
 # ---- which options make a command interactive ------------------------------------------------

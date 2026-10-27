@@ -1,8 +1,8 @@
 """push, pull and fetch against the bare remotes standing in for Overleaf."""
 import re
 
-
 from conftest import git, write
+from gitall import git_version, no_prompts
 from helpers import log_fetches, logged, make_problem
 
 
@@ -49,6 +49,9 @@ def test_push_publishes_new_branches_with_auto_setup_remote(world, run):
     git(a, "checkout", "-q", "-b", "feature")
     world.local_commit("A", {"x.tex": "x"})
     r = run("push", "-y", cwd=world.work)
+    if git_version()[1] < (2, 37):  # the setting came with git 2.37: older git needs push -u
+        assert "A: no upstream branch (to publish it: gitall -r A push -u origin HEAD)" in r.out
+        return
     assert r.code == 0, r
     assert "== A (feature, new on the remote)" in r.out
     assert "A: pushed feature [new branch]" in r.out
@@ -61,7 +64,7 @@ def test_push_answer_no_pushes_nothing(world, run):
     world.local_commit("A", {"x.tex": "x"})
     before = world.remote_head("A")
     r = run("push", cwd=world.work, answer="n")
-    assert r.code == 1 and "Push 1 repo? [y/N]" in r.out and "aborted" in r.out
+    assert r.code == 1 and "Push 1 repo? [y/N]" in r.err and "aborted" in r.out
     assert world.remote_head("A") == before
 
 
@@ -81,7 +84,7 @@ def test_force_push_warns_and_asks_differently(world, run):
     before = world.remote_head("A")
     r = run("push", "--force-with-lease", cwd=world.work, answer="n")
     assert "This is a force push: it can overwrite commits on the remote." in r.out
-    assert "Force-push 1 repo? [y/N]" in r.out
+    assert "Force-push 1 repo? [y/N]" in r.err
     assert world.remote_head("A") == before
 
 
@@ -378,3 +381,15 @@ def test_jobs_option_overrides_gitall_file(world, run, tmp_path):
     write(world.work / ".gitall", "jobs = 3\nA\nB\nC\n")
     run("-j", "1", "fetch", cwd=world.work)
     assert set(logged(log).values()) == {""}
+
+
+def test_parallel_runs_never_prompt(world, monkeypatch):
+    a = world.repo("A", remote=False)
+    for var in ("GIT_SSH_COMMAND", "GIT_SSH"):
+        monkeypatch.delenv(var, raising=False)
+    env = no_prompts({}, a)
+    assert env["GIT_TERMINAL_PROMPT"] == "0" and env["GCM_INTERACTIVE"] == "never"
+    assert env["GIT_SSH_COMMAND"] == "ssh -o BatchMode=yes"   # ssh asks on the terminal itself
+    git(a, "config", "core.sshCommand", "ssh -i other_key")     # your own ssh command is left alone
+    assert "GIT_SSH_COMMAND" not in no_prompts({}, a)
+    assert "GIT_SSH_COMMAND" not in no_prompts({"GIT_SSH": "plink"}, world.work)
