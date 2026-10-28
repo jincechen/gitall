@@ -1087,6 +1087,15 @@ def resolve_alias(cmd, args, cwd):
     return cmd, args, "git", chain
 
 
+def known_command(cmd, cwd):
+    """Whether git in cwd has this command: built in, a git-<cmd> program, or an alias
+    (the repo's own aliases too). True if git can't tell."""
+    if cmd in COMMON:
+        return True
+    names = git_ok(cwd, "--list-cmds=main,others,alias,nohelpers")
+    return names is None or cmd in names.split()
+
+
 def branch_plan(cmd, args):
     """('switch', branch) or ('create', branch, force) for a plain branch switch, else None."""
     if "--" in args or interactive(cmd, args):
@@ -1928,9 +1937,8 @@ def main(argv):
         hint = f"; {PROG} clone gets the ones listed in {ws.config}" if ws.missing else \
             f" (run it in or inside the folder that contains your repos, or list them in a {CONFIG} file)"
         die(f"no git repos found in {ws.root}{hint}")
-    if (o.picks or o.drops) and kind == "git" and cmd not in COMMON and \
-            any(cmd in (r.name, r.folder) for r in ws.repos) and \
-            cmd not in (git_ok(o.start, "--list-cmds=main,others,nohelpers") or cmd).split():
+    if (o.picks or o.drops) and kind == "git" and \
+            any(cmd in (r.name, r.folder) for r in ws.repos) and not known_command(cmd, o.start):
         # sh/bash/zsh turned  -r Deck*  into  -r Deck1 Deck2 Deck3: the second repo became the command
         die(f"'{cmd}' is one of the repos, not a git command: did the shell expand a glob? "
             f"Quote it: -r 'Deck*'")
@@ -1941,6 +1949,9 @@ def main(argv):
         out("no repo matches " + " ".join([*(f"-r {quote(p)}" for p in o.picks),
                                             *(f"-x {quote(d)}" for d in o.drops)]))
         return 0
+    if kind == "git" and not known_command(cmd, repos[0].path):
+        # a typo: let git say so (and suggest a command) once, not ask and then fail everywhere
+        return subprocess.call(["git", *USER_OPTS, cmd, *args], cwd=repos[0].path)
     run = Run(ws, repos, o, [cmd, *args])
     if kind == "shell":
         return run.passthrough(cmd, args, alias="shell")

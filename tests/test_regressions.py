@@ -1,4 +1,6 @@
 """Bugs found by reviewing the rewrite: each test reproduces one."""
+import re
+
 import pytest
 
 from conftest import git, write
@@ -115,3 +117,21 @@ def test_quiet_status_says_when_all_is_clean(world, run):
     world.repo("A")
     world.repo("B")
     assert run("-q", "status", cwd=world.work).out.strip() == "all 2 repos clean"
+
+
+def test_mistyped_command_is_reported_once_like_git(world, run):
+    world.repo("A", remote=False)
+    world.repo("B", remote=False)
+    r = run("stauts", cwd=world.work, tty=False)
+    assert r.code == 1
+    assert r.all.count("is not a git command") == 1 and "status" in r.err
+    assert "Will run" not in r.out and "not running interactively" not in r.err
+
+
+def test_a_repos_own_alias_is_not_taken_for_a_typo(world, run):
+    for name in ("A", "B"):
+        git(world.repo(name, remote=False), "config", "alias.hd", "rev-parse --short HEAD")
+    r = run("hd", cwd=world.work, answer="y")
+    assert r.code == 0, r
+    assert "is not a git command" not in r.all
+    assert len(re.findall(r"(?:^|\] )[AB]  [0-9a-f]{7,}$", r.out, re.M)) == 2   # after the prompt
