@@ -1,0 +1,42 @@
+# Lets pip/pipx install the single file as a `gitall` command:
+#   pipx install git+https://github.com/jincechen/gitall
+# Copying gitall.py onto your PATH works just as well (see README.md).
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gitall"
+dynamic = ["version"]
+description = "Run git in several repositories at once: type gitall where you would type git."
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Jince Chen"}]
+requires-python = ">=3.8"
+keywords = ["git", "multi-repo", "repositories", "cli"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+
+[project.urls]
+Homepage = "https://github.com/jincechen/gitall"
+Changelog = "https://github.com/jincechen/gitall/blob/main/CHANGELOG.md"
+
+[project.scripts]
+gitall = "gitall:cli"
+
+[tool.setuptools]
+py-modules = ["gitall"]
+
+[tool.setuptools.dynamic]
+version = {attr = "gitall.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

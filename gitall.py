@@ -43,6 +43,7 @@ Other options:
   -C DIR              start in DIR instead of the current directory
   -c NAME=VALUE, --no-pager, --literal-pathspecs, ...
                       git's own options are passed on to git
+  -v, --version       show gitall's version, then git's
   -h, --help          show this help
 
 Per-repo values: {repo} {path} {branch} {upstream} {default} in the arguments become
@@ -73,6 +74,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+__version__ = "1.0.0.dev0"
 # rename the file and the messages and config file follow; a link to it (ga, or git-all for
 # "git all") gives the name used in messages, and still reads the file's own config, .gitall
 PROG = Path(__file__).stem
@@ -1883,6 +1885,7 @@ def main(argv):
             out(usage())
             return 0
         elif a in ("--version", "-v"):
+            out(f"{PROG} {__version__}")
             return subprocess.call(["git", "--version"])
         elif a in GIT_FLAGS:
             USER_OPTS.append(a)
@@ -1914,6 +1917,8 @@ def main(argv):
             if cmd == "help" and not args:
                 out(usage())
                 return 0
+            if cmd == "version":
+                out(f"{PROG} {__version__}")
             return subprocess.call(["git", *USER_OPTS, cmd, *args], cwd=o.start)  # once, not per repo
         words = [a for a in args if not a.startswith("-")]
         once = (cmd == "clone" and words) or (cmd == "init" and words) or cmd.startswith("credential") or \
@@ -1964,7 +1969,8 @@ def main(argv):
     return run.passthrough(cmd, args)
 
 
-if __name__ == "__main__":
+def cli():
+    """The command: python gitall.py ..., or the gitall that pip/pipx installs."""
     try:
         code = main(sys.argv[1:])
     except KeyboardInterrupt:
@@ -1979,3 +1985,7 @@ if __name__ == "__main__":
             pass
         code = 141 if os.name != "nt" else 1    # like git killed by SIGPIPE
     sys.exit(code)
+
+
+if __name__ == "__main__":
+    cli()

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import gitall as gitall_module
 from conftest import ROOT, git, write
 import gitall
 from gitall import Res, Run
@@ -45,13 +46,15 @@ def test_jobs_needs_a_number(world, run):
     assert r.code == 2 and "needs a number" in r.err
 
 
-def test_git_version_runs_once(world, run):
+@pytest.mark.parametrize("argv", [["version"], ["--version"], ["-v"]])
+def test_version_shows_gitalls_then_gits_once(world, run, argv):
     world.repo("A", remote=False)
     world.repo("B", remote=False)
-    r = run("version", cwd=world.work)
-    assert r.code == 0 and r.out.count("git version") == 1
-    r = run("--version", cwd=world.work)
-    assert r.code == 0 and r.out.count("git version") == 1
+    r = run(*argv, cwd=world.work)
+    assert r.code == 0, r
+    lines = r.out.splitlines()
+    assert lines[0] == f"gitall {gitall_module.__version__}" and r.out.count("gitall ") == 1
+    assert r.out.count("git version") == 1
 
 
 def test_list_with_a_command_is_an_error(world, run):
@@ -256,6 +259,8 @@ def test_renaming_the_script_renames_messages_and_config(world, run_script, tmp_
     assert "Usage:  multigit" in r.out and ".multigit file" in r.out and "gitall" not in r.out
     r = run_script("-r", "zzz", "status", cwd=world.work, script=script)
     assert r.err.startswith("multigit: no repo matches")
+    r = run_script("--version", cwd=world.work, script=script)
+    assert r.out.startswith("multigit ")
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlinks")
