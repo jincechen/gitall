@@ -1,0 +1,45 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest       # newest Python and git
+            python: "3.x"
+          - os: ubuntu-22.04        # the oldest Python gitall supports
+            python: "3.8"
+          - os: macos-latest
+            python: "3.x"
+          - os: windows-latest
+            python: "3.x"
+          - os: windows-latest      # the oldest Python, with the .cmd launcher and PowerShell quoting
+            python: "3.8"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: git --version && python --version
+      - run: python -m pip install pytest
+      - run: python -m pytest -q
+      - name: install it as a command, as pipx does
+        run: python -m pip install .
+      - run: gitall --version
+
+  old-git:
+    # the runners bring a recent git: test against Ubuntu 22.04's own git 2.34, whose status
+    # doesn't report stashes
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git python3 python3-pytest
+      - uses: actions/checkout@v4
+      - run: git --version && python3 --version
+      - run: python3 -m pytest -q
