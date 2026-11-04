@@ -15,6 +15,7 @@ arguments mean what they mean in git. A few commands get extra help:
   fetch           one line per repo: what came in, then ahead/behind
   switch/checkout <branch>
                   previews which repos have the branch, asks once; the others are skipped
+  add             asks first if a conflicted file it adds still has conflict markers
   clone           with no URL: clones the repos listed in .gitall that are missing
   anything else   runs in every repo; repos with no output are left out; commands
                   that change things show what will run and ask first
@@ -1226,8 +1227,26 @@ class Run:
         self.width = max((width(r.name) for r in repos), default=0)
 
     # -- bookkeeping
-    def skip(self, repo, why):
-        self.skipped.append((repo, why))
+    def skip(self, repo, why, shown=False):
+        self.skipped.append([repo, why, shown])
+
+    def show_skipped(self):
+        new = [s for s in self.skipped if not s[2]]
+        if new:
+            out()
+            out(YELLOW("Skipped:"))
+            for s in new:
+                out(f"  {s[0].name}: {s[1]}")
+                s[2] = True
+
+    def ask(self, question, note=None):
+        """Confirm once, after listing the repos that will be skipped, so the answer covers them."""
+        if not self.o.yes:
+            self.show_skipped()
+        out()
+        if note:
+            out(note)
+        confirm(question, self.o.yes)
 
     def fail(self, repo, msg, retry=None):
         if "unknown switch `y'" in msg or "unknown option `yes'" in msg:
@@ -1238,11 +1257,7 @@ class Run:
         self.tally.setdefault(outcome, []).append(repo)
 
     def finish(self, label=None):
-        if self.skipped:
-            out()
-            out(YELLOW("Skipped:"))
-            for r, why in self.skipped:
-                out(f"  {r.name}: {why}")
+        self.show_skipped()
         if self.failed:
             out()
             out(RED("Failed:"))
@@ -1427,15 +1442,14 @@ class Run:
                 out("nothing to commit (stage changes with  git add  first, or use  commit -a  or  "
                     "commit -- <paths>)")
             self.finish()
-        out()
         if user_dry:
+            out()
             out(f"(dry run: {plural(len(todo), 'repo')} would be committed)")
             self.finish()
-        if one_editor:
-            out(YELLOW("You'll write one commit message for all of them."))
-        elif repo_editor or live_commit:
-            out(YELLOW("git will open an editor (or ask questions) in each repo in turn."))
-        confirm(f"Commit {plural(len(todo), 'repo')}?", self.o.yes)
+        note = YELLOW("You'll write one commit message for all of them.") if one_editor else \
+            YELLOW("git will open an editor (or ask questions) in each repo in turn.") \
+            if repo_editor or live_commit else None
+        self.ask(f"Commit {plural(len(todo), 'repo')}?", note)
         messages = {}
         if one_editor:
             message = self.write_message(previews)
@@ -1533,11 +1547,11 @@ class Run:
             else:
                 out(f"Will run:  git push {shown(args)}")
                 out(f"in: {' '.join(r.name for r, _ in todo)}")
-        out()
-        if not dry:
-            if force:
-                out(RED("This is a force push: it can overwrite commits on the remote."))
-            confirm(f"{'Force-push' if force else 'Push'} {plural(len(todo), 'repo')}?", self.o.yes)
+        if dry:
+            out()
+        else:
+            self.ask(f"{'Force-push' if force else 'Push'} {plural(len(todo), 'repo')}?",
+                     RED("This is a force push: it can overwrite commits on the remote.") if force else None)
         rargs_of = dict(todo)
 
         def work(r, batch):
@@ -1547,7 +1561,12 @@ class Run:
             if any(f == "!" for f, _, _ in refs) or (res.rc and re.search(r"rejected|fetch first", res.err)):
                 why = next((summary for f, _, summary in refs if f == "!"), "")
                 out(f"{r.name}: {RED('rejected')} {why.replace('[rejected]', '').strip()}".rstrip())
-                self.fail(r, "rejected: the remote has newer commits (pull first, then push again)", ["pull"])
+                if "non-fast-forward" in why and replaced_pushed_commits(r.path):
+                    self.fail(r, "rejected: you amended or rebased commits that were already pushed (if no "
+                                 "one else has pushed since, replace them with --force-with-lease)",
+                              ["push", "--force-with-lease"])
+                else:
+                    self.fail(r, "rejected: the remote has newer commits (pull first, then push again)", ["pull"])
             elif res.rc:
                 out(f"{r.name}: {RED('push failed')}")
                 out(indent("\n".join(t for t in (res.out, res.err) if t)))
@@ -1672,14 +1691,13 @@ class Run:
             label = kind or "no such branch, skipped"
             out(f"  {label + ':':<33} {names}")
         for r in groups.get(None, []):
-            self.skip(r, f"no branch '{plans[r][1][1]}'")
+            self.skip(r, f"no branch '{plans[r][1][1]}'", shown=True)     # listed just above
         if any(r.state.dirty for r, _ in todo):
             out("  (* has uncommitted changes: git takes them along, or refuses if they'd be lost)")
         if not todo:
             out("nothing to do")
             self.finish()
-        confirm(f"{'Create the branch in' if p[0] == 'create' else 'Switch'} {plural(len(todo), 'repo')}?",
-                self.o.yes)
+        self.ask(f"{'Create the branch in' if p[0] == 'create' else 'Switch'} {plural(len(todo), 'repo')}?")
         out()
         for r, rargs in todo:
             res = git(r.path, cmd, *rargs, env=self.env(r))
@@ -1701,7 +1719,7 @@ class Run:
             return 0
         for name, url in self.ws.missing:
             out(f"  {name}  <-  {url}")
-        confirm(f"Clone {plural(len(self.ws.missing), 'repo')} into {self.ws.root}?", self.o.yes)
+        self.ask(f"Clone {plural(len(self.ws.missing), 'repo')} into {self.ws.root}?")
         targets = [Repo(self.ws.root / name, self.ws.root) for name, _ in self.ws.missing]
         url_of = {r.name: url for r, (_, url) in zip(targets, self.ws.missing)}
 
@@ -1723,6 +1741,14 @@ class Run:
         live = interactive(cmd, args)
         shows = read_only(cmd, args) and alias != "shell"
         todo = self.plan(args, check=False)
+        if cmd == "add" and not live and not {"-n", "--dry-run"} & set(args):
+            with ThreadPoolExecutor(8) as ex:
+                found = list(ex.map(lambda t: conflict_markers(t[0].path), todo))
+            for (r, _), files in zip(todo, found):
+                if files:
+                    out(f"{r.name}: unresolved conflict in {', '.join(files)} (conflict markers still in it)")
+            if any(found):
+                self.ask("Add anyway?", "Adding marks the conflicts as resolved, markers and all.")
         if not (shows or cmd in NO_CONFIRM):
             if alias == "shell":
                 out(f"'{cmd}' is a shell alias: {self.o.alias_chain[-1]}")
@@ -1733,7 +1759,7 @@ class Run:
             else:
                 out(f"Will run:  git {shown([cmd, *args])}")
                 out(f"in: {' '.join(r.name for r, _ in todo)}")
-            confirm("Continue?", self.o.yes)
+            self.ask("Continue?")
         rargs_of = dict(todo)
         quiet_diff = cmd.startswith("diff") and bool({"--quiet", "--exit-code"} & set(args))
         matched = differs = False
@@ -1775,6 +1801,28 @@ def no_prompts(env, cwd):
     if not {"GIT_SSH_COMMAND", "GIT_SSH"} & env.keys() and git_ok(cwd, "config", "core.sshCommand") is None:
         env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
     return env
+
+
+def conflict_markers(path):
+    """The files with unresolved conflicts in the repo at path that still have conflict markers."""
+    listed = git_ok(path, "ls-files", "-u", "-z") or ""
+    found = []
+    for name in sorted({entry.split("\t", 1)[1] for entry in listed.split("\0") if "\t" in entry}):
+        try:
+            data = (path / name).read_bytes()
+        except OSError:
+            continue
+        if re.search(rb"^<{7}(?: |$)", data, re.M) and re.search(rb"^>{7}(?: |$)", data, re.M):
+            found.append(name)
+    return found
+
+
+def replaced_pushed_commits(path):
+    """Whether the remote's tip is a commit this branch once had and has since replaced (commit
+    --amend, rebase, reset): then the fix is push --force-with-lease, not pull."""
+    tip = git_ok(path, "rev-parse", "-q", "--verify", "@{upstream}")
+    branch = git_ok(path, "symbolic-ref", "-q", "HEAD")
+    return bool(tip and branch) and tip in (git_ok(path, "log", "-g", "--format=%H", branch) or "").split()
 
 
 def describe_change(path, before, after):

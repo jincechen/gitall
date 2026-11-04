@@ -132,6 +132,29 @@ def test_rejected_push_suggests_pull_and_others_still_push(world, run):
     assert "push: 1 pushed, 1 failed" in r.out
 
 
+def test_rejected_after_amending_a_pushed_commit_suggests_force_with_lease(world, run):
+    a = world.repo("A")
+    world.local_commit("A", {"x.tex": "x"})
+    git(a, "push", "-q")
+    git(a, "commit", "-q", "--amend", "-m", "amended")
+    r = run("push", "-y", cwd=world.work)
+    assert r.code == 1
+    assert "A: rejected: you amended or rebased commits that were already pushed" in r.out
+    assert "retry:  gitall -r A push --force-with-lease" in r.out
+    r = run("-r", "A", "push", "--force-with-lease", "-y", cwd=world.work)
+    assert r.code == 0 and world.remote_head("A") == world.head("A")
+
+
+def test_rejected_after_fetching_someone_elses_commits_suggests_pull(world, run):
+    world.repo("A")
+    world.local_commit("A", {"local.tex": "x"})
+    world.coauthor_edit("A", {"overleaf.tex": "y"})
+    git(world.work / "A", "fetch", "-q")
+    r = run("push", "-y", cwd=world.work)
+    assert "A: rejected (non-fast-forward)" in r.out
+    assert "retry:  gitall -r A pull" in r.out
+
+
 def test_rejected_then_pull_then_push(world, run):
     # the everyday Overleaf cycle: a co-author edited online while you edited locally
     world.repo("A")

@@ -39,7 +39,7 @@ def test_plan_switches_tracks_and_skips(world, run, cmd):
     assert plan_line(r.out, "switch", "A")
     assert plan_line(r.out, "already on it", "D")
     assert plan_line(r.out, "no such branch, skipped", "C")
-    assert "Skipped:\n  C: no branch 'feature'" in r.out
+    assert "C: no branch" not in r.out     # the plan already says so
     assert f"{cmd}: 2 switched, 1 skipped" in r.out
     assert [branch(x) for x in (a, b, c, d)] == ["feature", "feature", "main", "feature"]
     assert git(b, "rev-parse", "--abbrev-ref", "@{u}") == "origin/feature"

@@ -357,3 +357,24 @@ def test_command_help_runs_once(world, run):
     world.repo("B")
     r = run("log", "-h", cwd=world.work)
     assert r.all.count("usage: git log") == 1
+
+
+def test_add_asks_before_marking_conflicts_resolved(world, run):
+    a, b = world.repo("A"), world.repo("B")
+    make_problem(a, "merge")
+    write(b / "new.tex")
+    r = run("add", "-A", cwd=world.work, answer="n")
+    assert r.code == 1 and "A: unresolved conflict in main.tex" in r.out
+    assert git(a, "ls-files", "-u") and not git(b, "diff", "--cached", "--name-only")
+    r = run("add", "-A", cwd=world.work, answer="y")
+    assert r.code == 0, r
+    assert not git(a, "ls-files", "-u") and git(b, "diff", "--cached", "--name-only") == "new.tex"
+
+
+def test_add_does_not_ask_once_conflicts_are_resolved(world, run):
+    a = world.repo("A")
+    make_problem(a, "merge")
+    write(a / "main.tex", "both sides\n")
+    r = run("add", "-A", cwd=world.work, tty=False)
+    assert r.code == 0, r
+    assert not git(a, "ls-files", "-u")

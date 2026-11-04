@@ -299,6 +299,15 @@ def test_non_ascii_filenames_in_preview(world, run):
     assert "A  Übung_讲义.tex" in r.out
 
 
+def test_repos_to_skip_are_listed_before_the_question(world, run):
+    a, b = world.repo("A"), world.repo("B")
+    write(b / "main.tex", "changed\n")
+    make_problem(a, "index.lock")
+    r = run("commit", "-am", "x", cwd=world.work, answer="n")    # so seen before answering no
+    assert r.code == 1 and "Commit 1 repo?" in r.err
+    assert r.out.count("Skipped:") == 1 and "Skipped:\n  A: index.lock exists" in r.out
+
+
 @pytest.mark.parametrize("kind", PROBLEMS)
 def test_unsafe_repos_are_skipped(world, run, kind):
     a, b = world.repo("A"), world.repo("B")
