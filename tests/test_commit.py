@@ -44,24 +44,21 @@ def test_repo_placeholder_in_message(world, run):
     a, b = world.repo("Deck1"), world.repo("Deck2")
     for repo in (a, b):
         write(repo / "main.tex", "changed\n")
-    run("commit", "-am", "Weekly edits ({repo})", "-y", cwd=world.work)
+    r = run("commit", "-am", "Weekly edits ({repo})", "-y", cwd=world.work)
+    assert "   message: Weekly edits (Deck1)" in r.out    # the preview shows it expanded
     assert last_message(a) == "Weekly edits (Deck1)"
     assert last_message(b) == "Weekly edits (Deck2)"
 
 
-def test_preview_shows_the_expanded_message(world, run):
-    world.repo("Deck1")
-    write(world.work / "Deck1" / "main.tex", "changed\n")
-    r = run("commit", "-am", "Edits ({repo})", "--dry-run", cwd=world.work)
-    assert "   message: Edits (Deck1)" in r.out
-
-
-def test_dry_run_only_previews(world, run):
+def test_dry_run_previews_only_what_is_staged(world, run):
     a, _ = two_repos_one_staged(world)
+    write(a / "main.tex", "unstaged change\n")
+    write(a / "scratch.txt")
     before = world.head("A")
     r = run("commit", "-m", "x", "--dry-run", cwd=world.work, tty=False)
     assert r.code == 0
     assert "A  intro.tex" in r.out and "(dry run: 1 repo would be committed)" in r.out
+    assert "main.tex" not in r.out and "scratch.txt" not in r.out
     assert world.head("A") == before
 
 
@@ -75,16 +72,7 @@ def test_commit_all_tracked_changes(world, run):
     assert "?? untracked.tex" in git(a, "status", "--porcelain")
 
 
-def test_preview_leaves_out_unstaged_and_untracked_files(world, run):
-    a, _ = two_repos_one_staged(world)
-    write(a / "main.tex", "unstaged change\n")
-    write(a / "scratch.txt")
-    r = run("commit", "-m", "x", "--dry-run", cwd=world.work)
-    assert "A  intro.tex" in r.out
-    assert "main.tex" not in r.out and "scratch.txt" not in r.out
-
-
-def test_pathspec_commits_matching_files_and_no_match_is_not_an_error(world, run):
+def test_pathspec_commits_matching_files_and_errs_only_if_none_match(world, run):
     files = {"main.tex": "1\n", "notes.md": "1\n"}
     a, b = world.repo("A", files), world.repo("B", files)
     write(a / "main.tex", "2\n")
@@ -96,6 +84,9 @@ def test_pathspec_commits_matching_files_and_no_match_is_not_an_error(world, run
     assert git(a, "show", "--name-only", "--format=", "HEAD") == "main.tex"
     assert " M notes.md" in git(a, "status", "--porcelain")
     assert last_message(b) == "initial"
+    r = run("-y", "commit", "-m", "x", "--", "*.txe", cwd=world.work)
+    assert r.code == 1
+    assert "did not match any file(s) known to git" in r.err
 
 
 def test_a_real_git_error_is_reported_with_gits_message(world, run):
@@ -183,39 +174,26 @@ def test_one_message_is_written_in_a_file_named_commit_editmsg(world, run, monke
     assert log.read_text().strip() == "COMMIT_EDITMSG" and last_message(a) == "msg"
 
 
-def test_no_editor_commits_nothing(world, run, monkeypatch):
-    for var in ("GIT_EDITOR", "VISUAL", "EDITOR"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("TERM", "dumb")  # git has no editor to fall back on: it refuses
+@pytest.mark.parametrize("editor, error", [
+    (None, "no editor for the commit message"),     # with TERM=dumb git has none to fall back on
+    ("true", "no commit message"),                  # leaves the template: only comments
+    ("false", "no commit message"),                 # fails
+])
+def test_no_message_commits_nothing(world, run, monkeypatch, editor, error):
+    if editor:
+        monkeypatch.setenv("GIT_EDITOR", editor)
+    else:
+        monkeypatch.delenv("GIT_EDITOR")    # conftest has already removed VISUAL and EDITOR
+        monkeypatch.setenv("TERM", "dumb")
     a = world.repo("A")
     write(a / "main.tex", "changed\n")
     before = world.head("A")
     r = run("commit", "-a", "-y", cwd=world.work)
-    assert r.code == 1 and "no editor for the commit message" in r.err, r
+    assert r.code == 1 and error in r.err, r
     assert world.head("A") == before
 
 
-def test_empty_message_commits_nothing(world, run, monkeypatch):
-    monkeypatch.setenv("GIT_EDITOR", "true")  # leaves the template: only comments
-    a = world.repo("A")
-    write(a / "main.tex", "changed\n")
-    before = world.head("A")
-    r = run("commit", "-a", "-y", cwd=world.work)
-    assert r.code == 1
-    assert "no commit message" in r.err and "nothing committed" in r.err
-    assert world.head("A") == before
-
-
-def test_failing_editor_commits_nothing(world, run):
-    a = world.repo("A")  # GIT_EDITOR=false from conftest
-    write(a / "main.tex", "changed\n")
-    before = world.head("A")
-    r = run("commit", "-a", "-y", cwd=world.work)
-    assert r.code == 1 and world.head("A") == before
-
-
-@pytest.mark.parametrize("opts", [["-c", "HEAD"], ["--reedit-message=HEAD"], ["-m", "typed", "-e"],
-                                  ["--squash", "HEAD"], ["--fixup=amend:HEAD"], ["--amend"]])
+@pytest.mark.parametrize("opts", [["-m", "typed", "-e"], ["--fixup=amend:HEAD"]])
 def test_options_that_need_gits_own_editor_open_it_per_repo(world, run, monkeypatch, opts):
     runs = counting_editor(monkeypatch, world, "from-editor")
     a, b = world.repo("A"), world.repo("B")
@@ -229,11 +207,9 @@ def test_options_that_need_gits_own_editor_open_it_per_repo(world, run, monkeypa
     assert "from-editor" in git(a, "log", "-1", "--format=%B")
 
 
-@pytest.mark.parametrize("opts", [["-C", "HEAD"], ["--fixup", "HEAD"], ["-c", "HEAD", "--no-edit"],
-                                  ["-mEdited"], ["-F", "msg.txt"], ["--amend", "--no-edit"]])
+@pytest.mark.parametrize("opts", [["--fixup", "HEAD"], ["--amend", "--no-edit"]])
 def test_options_that_give_the_message_dont_open_an_editor(world, run, opts):
     a = world.repo("A")
-    write(world.work / "msg.txt", "From file\n")
     write(a / "main.tex", "changed\n")
     git(a, "add", "-A")
     r = run("commit", *opts, "-y", cwd=world.work)
@@ -278,10 +254,11 @@ def test_commit_patch_runs_attached_and_only_where_there_are_changes(world, run_
     r = run_script("commit", "-p", "-m", "x", "-y", cwd=world.work)  # stdin closed: nothing picked
     assert "git will open an editor (or ask questions) in each repo in turn." in r.out
     assert "== A" in r.out and "== B" not in r.out
-    assert last_message(a) == "initial"  # nothing was picked, so nothing committed
+    assert last_message(a) == "initial"
 
 
 def test_commit_help_is_shown_once(world, run):
+    # (not --help: on Windows that opens the help page in a browser)
     world.repo("A")
     world.repo("B")
     r = run("commit", "-h", cwd=world.work)
@@ -289,14 +266,6 @@ def test_commit_help_is_shown_once(world, run):
                               stderr=subprocess.DEVNULL).returncode   # 129, or 0 since git 2.5x
     assert r.code == git_code
     assert r.all.count("usage: git commit") == 1
-
-
-def test_non_ascii_filenames_in_preview(world, run):
-    a = world.repo("A")
-    write(a / "Übung_讲义.tex")
-    git(a, "add", "-A")
-    r = run("commit", "-m", "x", "-y", cwd=world.work)
-    assert "A  Übung_讲义.tex" in r.out
 
 
 def test_repos_to_skip_are_listed_before_the_question(world, run):

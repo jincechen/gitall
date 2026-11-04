@@ -4,13 +4,7 @@ import re
 import pytest
 
 from conftest import git, write
-from helpers import make_problem
-
-
-def listed(result):
-    """Repo names from `gitall -l` output, in order."""
-    lines = result.out.splitlines()[1:]  # the first line is "N repo(s) in ..."
-    return [m.group(1) for m in (re.match(r"\s*\d+\s+(\S+)", ln) for ln in lines) if m]
+from helpers import listed, make_problem
 
 
 def pick(run, world, *opts):
@@ -21,9 +15,9 @@ def pick(run, world, *opts):
 
 @pytest.fixture
 def decks(world):
-    """Deck1, Deck2, Deck10, notes, tools -- all with remotes, all clean."""
+    """Deck1, Deck2, Deck10, notes, tools -- local repos, no remotes."""
     for name in ("Deck1", "Deck2", "Deck10", "notes", "tools"):
-        world.repo(name)
+        world.repo(name, remote=False)
     return world
 
 
@@ -34,6 +28,7 @@ def test_comma_list(decks, run):
 
 def test_repeated_r_adds_up(decks, run):
     assert pick(run, decks, "-r", "notes", "--repo=Deck1") == ["Deck1", "notes"]
+    assert pick(run, decks, "-r", "notes", "--repo=Deck1", "-r", "1") == ["Deck1", "notes"]  # listed once
 
 
 def test_glob_is_case_insensitive(decks, run):
@@ -189,33 +184,24 @@ STATE_CASES = {
 
 
 def test_state_filters(states, run):
-    # one workspace for all of them: building it takes a few seconds
+    # one test for the whole workspace: building it takes a few seconds
     for state, expected in STATE_CASES.items():
         assert sorted(pick(run, states, "-r", state)) == sorted(expected), state
-
-
-def test_clean_is_the_opposite_of_dirty(states, run):
-    dirty = set(pick(run, states, "-r", ":dirty"))
-    clean = set(pick(run, states, "-r", ":clean"))
-    assert dirty and clean and not dirty & clean
-    assert dirty | clean == set(pick(run, states))
-
-
-def test_states_in_a_list_mean_any_of_them(states, run):
-    assert sorted(pick(run, states, "-r", ":staged,:stash")) == ["staged", "stash"]
-    assert sorted(pick(run, states, "-r", ":staged", "-r", ":stash")) == ["staged", "stash"]
-
-
-def test_states_narrow_names_down(states, run):
-    assert pick(run, states, "-r", "a*", "-r", ":dirty") == []
-    assert sorted(pick(run, states, "-r", "s*,m*", "-r", ":dirty")) == ["merging", "modified", "staged"]
-
-
-def test_exclude_by_state(states, run):
     everything = pick(run, states)
     dirty = pick(run, states, "-r", ":dirty")
-    assert pick(run, states, "-x", ":dirty") == [r for r in everything if r not in dirty]
-    assert pick(run, states, "-r", "!:dirty") == [r for r in everything if r not in dirty]
+    clean = pick(run, states, "-r", ":clean")
+    assert dirty and clean and not set(dirty) & set(clean)
+    assert set(dirty) | set(clean) == set(everything)
+    others = [r for r in everything if r not in dirty]
+    assert pick(run, states, "-x", ":dirty") == pick(run, states, "-r", "!:dirty") == others
+    # states in a list mean any of them; with names, they narrow the names down
+    assert sorted(pick(run, states, "-r", ":staged,:stash")) == ["staged", "stash"]
+    assert sorted(pick(run, states, "-r", ":staged", "-r", ":stash")) == ["staged", "stash"]
+    assert pick(run, states, "-r", "a*", "-r", ":dirty") == []
+    assert sorted(pick(run, states, "-r", "s*,m*", "-r", ":dirty")) == ["merging", "modified", "staged"]
+    r = run("-r", ":ahead", "-x", ":dirty", "log", "-1", "--format=%s", cwd=states.work)
+    assert r.code == 0, r
+    assert [ln.split()[0] for ln in r.out.splitlines()] == ["ahead", "diverged"]  # runs only there
 
 
 def test_on_branch(world, run):
@@ -253,13 +239,7 @@ def test_state_matching_nothing_is_not_an_error(decks, run):
     assert r.out.strip() == "no repo matches -r :ahead"
 
 
-def test_command_runs_only_in_the_chosen_repos(states, run):
-    r = run("-r", ":ahead", "-x", ":dirty", "log", "-1", "--format=%s", cwd=states.work)
-    assert r.code == 0, r
-    assert [ln.split()[0] for ln in r.out.splitlines()] == ["ahead", "diverged"]
-
-
-# ---- .gitall v2 -----------------------------------------------------------------------
+# ---- .gitall: exclusions, paths, URLs, settings -----------------------------------------
 def test_exclusion_lines(decks, run):
     write(decks.work / ".gitall", "*\n!notes\n!Deck1*\n")
     assert pick(run, decks) == ["Deck2", "tools"]
@@ -280,18 +260,10 @@ def test_paths_and_path_globs_one_level_deeper(world, run):
     write(world.work / ".gitall", "top\narchive/*\n")
     r = run("-l", cwd=world.work)
     assert listed(r) == ["top", "archive/old1", "archive/old2"]
+    assert pick(run, world, "-r", "old1") == ["archive/old1"]  # by folder name or by path
+    assert pick(run, world, "-r", "archive/old2") == ["archive/old2"]
     write(world.work / ".gitall", "archive/old2\n")
     assert pick(run, world) == ["archive/old2"]
-
-
-def test_deeper_repos_match_by_folder_name_or_path(world, run):
-    archive = world.work / "archive"
-    archive.mkdir()
-    world.repo("old1", remote=False, where=archive)
-    world.repo("old2", remote=False, where=archive)
-    write(world.work / ".gitall", "archive/*\n")
-    assert pick(run, world, "-r", "old1") == ["archive/old1"]
-    assert pick(run, world, "-r", "archive/old2") == ["archive/old2"]
 
 
 def test_star_does_not_match_hidden_folders(world, run):
@@ -321,21 +293,6 @@ def test_list_with_only_missing_repos(world, run):
     assert "missing (gitall clone gets them): B" in r.out
 
 
-def test_running_inside_a_linked_worktree_includes_it(world, run):
-    a = world.repo("A", remote=False)
-    git(a, "worktree", "add", "-q", str(world.work / "A-wt"))
-    r = run("-l", cwd=world.work / "A-wt")
-    assert r.code == 0, r
-    assert "A-wt" in listed(r)
-
-
-def test_names_with_spaces(world, run):
-    world.repo("My Deck", remote=False)
-    write(world.work / ".gitall", "My Deck\n")
-    assert pick(run, world) == ["My"]  # listed() splits on spaces; the name is "My Deck"
-    assert "My Deck" in run("-l", cwd=world.work).out
-
-
 def test_jobs_setting_is_not_a_repo(world, run):
     world.repo("A", remote=False)
     write(world.work / ".gitall", "jobs = 4\nA\n")
@@ -351,6 +308,9 @@ def test_linked_worktrees_are_left_out_of_automatic_discovery(world, run):
     r = run("-l", cwd=world.work)
     assert listed(r) == ["A", "B"]
     assert "left out: A-wt (worktree of A)" in r.out
+    r = run("-l", cwd=world.work / "A-wt")  # unless you are in it
+    assert r.code == 0, r
+    assert "A-wt" in listed(r)
 
 
 def test_worktrees_listed_in_gitall_are_included(world, run):

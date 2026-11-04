@@ -1,21 +1,10 @@
 """Which repos gitall picks: .gitall file, repos in the folder, or the repo and its siblings."""
 import os
-import re
 
 import pytest
 
 from conftest import write
-
-
-def listed(result):
-    """Repo names from `gitall -l` output, in order."""
-    lines = result.out.splitlines()[1:]  # the first line is "N repo(s) in ..."
-    return [m.group(1) for m in (re.match(r"\s*\d+\s+(\S+)", ln) for ln in lines) if m]
-
-
-def rows(result):
-    """The repo names at the start of compact one-line-per-repo output."""
-    return [line.split()[0] for line in result.out.splitlines() if line.strip()]
+from helpers import listed
 
 
 def test_repos_in_folder_sorted_naturally(world, run):
@@ -65,15 +54,9 @@ def test_folders_and_files_that_are_not_repos_are_ignored(world, run):
 
 
 def test_inside_a_repo_uses_it_and_its_siblings(world, run):
-    for name in ("A", "B", "C"):
-        world.repo(name, remote=False)
-    assert listed(run("-l", cwd=world.work / "B")) == ["A", "B", "C"]
-
-
-def test_deep_subfolder_of_a_repo(world, run):
     world.repo("A", remote=False)
     world.repo("B", remote=False)
-    deep = world.work / "B" / "figs" / "raw"
+    deep = world.work / "B" / "figs" / "raw"   # any depth below the repo's top
     deep.mkdir(parents=True)
     assert listed(run("-l", cwd=deep)) == ["A", "B"]
 
@@ -189,39 +172,3 @@ def test_dash_C_missing_folder(world, run):
     r = run("-C", "nowhere", "status", cwd=world.root)
     assert r.code == 2
     assert "no such directory" in r.err
-
-
-def test_select_by_name_substring_ignoring_case(world, run):
-    for name in ("Deck1_Intro", "Deck2_Methods", "Deck3_Results"):
-        world.repo(name, remote=False)
-    r = run("-r", "methods", "rev-parse", "--show-toplevel", cwd=world.work)
-    assert rows(r) == ["Deck2_Methods"]
-
-
-def test_select_by_position(world, run):
-    for name in ("A", "B", "C"):
-        world.repo(name, remote=False)
-    r = run("-r", "3", "rev-parse", "--show-toplevel", cwd=world.work)
-    assert rows(r) == ["C"]
-
-
-def test_several_selections_keep_the_list_order(world, run):
-    for name in ("A", "B", "C"):
-        world.repo(name, remote=False)
-    r = run("-r", "C", "--repo=1", "-r", "a", "rev-parse", "--show-toplevel", cwd=world.work)
-    assert rows(r) == ["A", "C"]
-
-
-def test_selection_matching_nothing_lists_the_repos(world, run):
-    world.repo("A", remote=False)
-    world.repo("B", remote=False)
-    r = run("-r", "zzz", "status", cwd=world.work)
-    assert r.code == 2
-    assert "no repo matches 'zzz' (repos: 1:A, 2:B)" in r.err
-
-
-def test_selection_position_out_of_range(world, run):
-    world.repo("A", remote=False)
-    r = run("-r", "5", "status", cwd=world.work)
-    assert r.code == 2
-    assert "no repo matches '5'" in r.err

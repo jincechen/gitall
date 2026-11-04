@@ -41,10 +41,15 @@ def test_staged_counts(world, run):
 
 
 def test_ahead_is_shown(world, run):
-    world.repo("A")
+    a = world.repo("A")
     world.local_commit("A", {"x.tex": "x"})
     r = run("status", cwd=world.work)
     assert r.out.strip() == "A  main  ahead 1"
+    # a damaged commit-graph makes git print "error: commit-graph file is too small" and exit 0;
+    # that once got parsed as the ahead/behind counts
+    write(a / ".git" / "objects" / "info" / "commit-graph", "garbage" * 8)
+    r = run("status", cwd=world.work)
+    assert r.code == 0 and "A  main  ahead 1" in r.out, r
 
 
 def test_behind_is_shown_after_a_fetch(world, run):
@@ -124,7 +129,11 @@ def test_git_too_old(world, run, monkeypatch, tmp_path):
 
 def test_long_file_lists_are_capped(world, run):
     a = world.repo("A")
-    for i in range(15):
+    for i in range(11):
+        write(a / f"new{i:02}.tex")
+    r = run("status", cwd=world.work)
+    assert r.out.count("?? new") == 11 and "more" not in r.out   # eleven are all listed
+    for i in range(11, 15):
         write(a / f"new{i:02}.tex")
     r = run("status", cwd=world.work)
     assert "A  main  15 untracked" in r.out
@@ -132,18 +141,10 @@ def test_long_file_lists_are_capped(world, run):
     assert "... and 5 more (gitall -r A status -s)" in r.out
 
 
-def test_eleven_files_are_all_listed(world, run):
-    a = world.repo("A")
-    for i in range(11):
-        write(a / f"new{i:02}.tex")
-    r = run("status", cwd=world.work)
-    assert r.out.count("?? new") == 11
-    assert "more" not in r.out
-
-
 def test_quiet_hides_repos_with_nothing_to_report(world, run):
     world.repo("A")
     b = world.repo("B")
+    assert run("-q", "status", cwd=world.work).out.strip() == "all 2 repos clean"
     write(b / "main.tex", "changed\n")
     r = run("-q", "status", cwd=world.work)
     assert "A" not in r.out.split()
@@ -154,17 +155,12 @@ def test_stale_fetch_note(world, run):
     a = world.repo("A")
     world.repo("B")
     git(a, "fetch", "-q")
+    assert "last fetch" not in run("status", cwd=world.work).out   # not after a recent fetch
     old = time.time() - 3 * 3600
     os.utime(a / ".git" / "FETCH_HEAD", (old, old))
     r = run("status", cwd=world.work)
     assert "(ahead/behind is as of each repo's last fetch; oldest: A, 3 hours ago. gitall fetch updates it)" \
         in r.out
-
-
-def test_no_note_after_a_recent_fetch(world, run):
-    a = world.repo("A")
-    git(a, "fetch", "-q")
-    assert "last fetch" not in run("status", cwd=world.work).out
 
 
 def test_status_options_give_plain_git_status(world, run):
@@ -184,31 +180,17 @@ def test_status_pathspec_still_compact(world, run):
     assert " M main.tex" in r.out and "other.md" not in r.out
 
 
-def test_merge_in_progress_is_flagged(world, run):
-    a = world.repo("A")
-    make_problem(a, "merge")
+@pytest.mark.parametrize("kind, patterns", [
+    ("merge", [r"1 conflict  MERGE IN PROGRESS", r"UU main\.tex"]),
+    ("rebase", [r"REBASE IN PROGRESS"]),
+    ("index.lock", [r"A  main  index\.lock"]),
+    ("detached", [r"^A  \(detached [0-9a-f]{7}\)  no upstream$"]),   # not clean
+])
+def test_problems_are_flagged(world, run, kind, patterns):
+    make_problem(world.repo("A"), kind)
     r = run("status", cwd=world.work)
-    assert "1 conflict  MERGE IN PROGRESS" in r.out
-    assert "UU main.tex" in r.out
-
-
-def test_rebase_in_progress_is_flagged(world, run):
-    a = world.repo("A")
-    make_problem(a, "rebase")
-    assert "REBASE IN PROGRESS" in run("status", cwd=world.work).out
-
-
-def test_index_lock_is_flagged(world, run):
-    a = world.repo("A")
-    make_problem(a, "index.lock")
-    assert "A  main  index.lock" in run("status", cwd=world.work).out
-
-
-def test_detached_head_is_not_clean(world, run):
-    a = world.repo("A")
-    make_problem(a, "detached")
-    r = run("status", cwd=world.work)
-    assert re.search(r"^A  \(detached [0-9a-f]{7}\)  no upstream$", r.out, re.M), r
+    for pattern in patterns:
+        assert re.search(pattern, r.out, re.M), r
 
 
 def test_repo_without_commits(world, run):
@@ -233,14 +215,3 @@ def test_columns_line_up(world, run):
     lines = run("status", cwd=world.work).out.splitlines()
     assert lines[0].startswith("A         main       ")
     assert lines[1].startswith("LongName  feature/x  ")
-
-
-def test_warnings_from_git_do_not_break_ahead_behind(world, run):
-    # a damaged commit-graph makes git print "error: commit-graph file is too small" and exit 0;
-    # that once got parsed as the ahead/behind counts
-    a = world.repo("A")
-    world.local_commit("A", {"x.tex": "x"})
-    write(a / ".git" / "objects" / "info" / "commit-graph", "garbage" * 8)
-    r = run("status", cwd=world.work)
-    assert r.code == 0
-    assert "A  main  ahead 1" in r.out

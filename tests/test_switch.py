@@ -38,6 +38,7 @@ def test_plan_switches_tracks_and_skips(world, run, cmd):
     assert "switch to feature:" in r.out
     assert plan_line(r.out, "switch", "A")
     assert plan_line(r.out, "already on it", "D")
+    assert plan_line(r.out, "new branch tracking origin/feature", "B")
     assert plan_line(r.out, "no such branch, skipped", "C")
     assert "C: no branch" not in r.out     # the plan already says so
     assert f"{cmd}: 2 switched, 1 skipped" in r.out
@@ -45,20 +46,9 @@ def test_plan_switches_tracks_and_skips(world, run, cmd):
     assert git(b, "rev-parse", "--abbrev-ref", "@{u}") == "origin/feature"
 
 
-def test_plan_line_for_a_new_tracking_branch(world, run):
-    four_repos(world)
-    r = run("-y", "switch", "feature", cwd=world.work)
-    assert re.search(r"^  new branch tracking origin/feature:\s*B$", r.out, re.M), r
-
-
-def test_plan_labels_are_separated_from_the_names(world, run):
-    four_repos(world)
-    r = run("-y", "switch", "feature", cwd=world.work)
-    assert plan_line(r.out, "new branch tracking origin/feature", "B"), r
-
-
 def test_switch_asks_first(world, run):
-    a, b, c, d = four_repos(world)
+    a = world.repo("A", remote=False)
+    git(a, "branch", "feature")
     r = run("switch", "feature", cwd=world.work, tty=False)
     assert r.code == 2 and "not running interactively" in r.err
     assert branch(a) == "main"

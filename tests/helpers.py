@@ -1,4 +1,6 @@
-"""Put a repo into the states gitall must not commit/pull/push in."""
+"""Repos in states gitall must not commit/pull/push in, fetch logs, and `gitall -l` output."""
+import re
+
 from conftest import git, write
 
 
@@ -53,3 +55,9 @@ def logged(log):
     if not log.exists():
         return {}
     return dict((line.split(" ", 1) + [""])[:2] for line in log.read_text().splitlines())
+
+
+def listed(result):
+    """Repo names from `gitall -l` output, in order."""
+    lines = result.out.splitlines()[1:]  # the first line is "N repo(s) in ..."
+    return [m.group(1) for m in (re.match(r"\s*\d+\s+(\S+)", ln) for ln in lines) if m]

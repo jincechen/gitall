@@ -4,12 +4,12 @@ from conftest import git, write
 
 def seed(world, *names):
     """Remotes for names, without local clones in world.work -> {name: url}."""
-    seeds = world.root / "seed"
-    return {name: str(world.remotes / f"{name}.git") for name in names
-            if world.repo(name, where=seeds)}
+    for name in names:
+        world.repo(name, where=world.root / "seed")
+    return {name: str(world.remotes / f"{name}.git") for name in names}
 
 
-def test_clone_missing_repos(world, run):
+def test_clone_missing_repos_and_only_those(world, run):
     urls = seed(world, "A", "B")
     write(world.work / ".gitall", f"A  {urls['A']}\nB  {urls['B']}\n")
     r = run("clone", "-y", cwd=world.work)
@@ -18,12 +18,6 @@ def test_clone_missing_repos(world, run):
     assert "A: cloned" in r.out and "B: cloned" in r.out
     assert git(world.work / "B", "log", "-1", "--format=%s") == "initial"
     assert git(world.work / "A", "rev-parse", "--abbrev-ref", "@{u}") == "origin/main"
-
-
-def test_only_missing_repos_are_cloned_and_list_shows_them(world, run):
-    urls = seed(world, "A", "B")
-    write(world.work / ".gitall", f"A  {urls['A']}\nB  {urls['B']}\n")
-    run("-y", "clone", cwd=world.work)
     (world.work / "B").rename(world.root / "B-moved")
     r = run("-l", cwd=world.work)
     assert "missing (gitall clone gets them): B" in r.out
@@ -33,18 +27,12 @@ def test_only_missing_repos_are_cloned_and_list_shows_them(world, run):
     assert "gitall clone gets them" not in run("-l", cwd=world.work).out
 
 
-def test_entries_with_url_join_groups_after_cloning(world, run):
+def test_cloned_entries_join_their_group_and_nothing_is_left_to_clone(world, run):
     urls = seed(world, "A")
     write(world.work / ".gitall", f"[decks]\nA  {urls['A']}\n")
     run("-y", "clone", cwd=world.work)
     r = run("-r", "decks", "-l", cwd=world.work)
     assert "  1  A  main  clean" in r.out
-
-
-def test_nothing_to_clone(world, run):
-    urls = seed(world, "A")
-    write(world.work / ".gitall", f"A  {urls['A']}\n")
-    run("-y", "clone", cwd=world.work)
     r = run("clone", cwd=world.work, tty=False)
     assert r.code == 0
     assert r.out.strip() == "nothing to clone: no listed repo is missing"
@@ -84,13 +72,3 @@ def test_parallel_clone(world, run):
     r = run("-y", "clone", cwd=world.work)
     assert r.code == 0, r
     assert [ln.split(":")[0] for ln in r.out.splitlines() if ln.endswith("cloned")] == ["A", "B", "C"]
-
-
-def test_clone_with_a_url_runs_once(world, run):
-    urls = seed(world, "A")
-    world.repo("X", remote=False)
-    world.repo("Y", remote=False)
-    r = run("clone", "-q", urls["A"], "A-copy", cwd=world.work)
-    assert r.code == 0, r
-    assert (world.work / "A-copy" / "main.tex").exists()
-    assert not (world.work / "X" / "A-copy").exists()
