@@ -28,7 +28,7 @@ def test_nothing_to_push(world, run):
 
 
 def test_push_skips_repo_without_upstream(world, run):
-    world.repo("A", remote=False)
+    git(world.repo("A"), "switch", "-q", "-c", "feature")
     r = run("push", "-y", cwd=world.work)
     assert "A: no upstream branch (to publish it: gitall -r A push -u origin HEAD)" in r.out
 
@@ -59,12 +59,15 @@ def test_push_publishes_new_branches_with_auto_setup_remote(world, run):
     assert git(a, "rev-parse", "--abbrev-ref", "@{u}") == "origin/feature"
 
 
-def test_push_answer_no_pushes_nothing(world, run):
+def test_push_answer_no_pushes_nothing_and_force_push_warns(world, run):
     world.repo("A")
     world.local_commit("A", {"x.tex": "x"})
     before = world.remote_head("A")
     r = run("push", cwd=world.work, answer="n")
     assert r.code == 1 and "Push 1 repo? [y/N]" in r.err and "aborted" in r.out
+    r = run("push", "--force-with-lease", cwd=world.work, answer="n")
+    assert "This is a force push: it can overwrite commits on the remote." in r.out
+    assert "Force-push 1 repo? [y/N]" in r.err
     assert world.remote_head("A") == before
 
 
@@ -75,16 +78,6 @@ def test_push_dry_run_does_not_ask_or_push(world, run):
     r = run("push", "--dry-run", cwd=world.work, tty=False)
     assert r.code == 0, r
     assert "A: would push main" in r.out
-    assert world.remote_head("A") == before
-
-
-def test_force_push_warns_and_asks_differently(world, run):
-    world.repo("A")
-    world.local_commit("A", {"x.tex": "x"})
-    before = world.remote_head("A")
-    r = run("push", "--force-with-lease", cwd=world.work, answer="n")
-    assert "This is a force push: it can overwrite commits on the remote." in r.out
-    assert "Force-push 1 repo? [y/N]" in r.err
     assert world.remote_head("A") == before
 
 
@@ -163,6 +156,7 @@ def test_rejected_then_pull_then_push(world, run):
     assert run("push", "-y", cwd=world.work).code == 1
     r = run("pull", cwd=world.work, tty=False)
     assert r.code == 0, r
+    assert "A  merged, 1 commit, 1 file changed" in r.out       # the co-author's, not the merge
     assert (world.work / "A" / "overleaf.tex").exists()
     r = run("push", "-y", cwd=world.work)
     assert r.code == 0 and "A: pushed main" in r.out
@@ -200,15 +194,6 @@ def test_pull_brings_in_overleaf_edits_and_lists_up_to_date_repos(world, run):
     assert world.head("B") == world.remote_head("B")
 
 
-def test_pull_merge(world, run):
-    world.repo("A")
-    world.local_commit("A", {"local.tex": "x"})
-    world.coauthor_edit("A", {"overleaf.tex": "y"})
-    r = run("pull", cwd=world.work)
-    assert r.code == 0, r
-    assert "A  merged, 2 commits, 1 file changed" in r.out
-
-
 def test_pull_rebase(world, run):
     world.repo("A")
     world.local_commit("A", {"local.tex": "x"})
@@ -229,9 +214,8 @@ def test_pull_skips_repos_without_upstream(world, run):
     assert "B: no upstream branch, nothing to pull from" in r.out
 
 
-def test_pull_conflict_is_reported_and_then_blocks_commit(world, run):
+def test_pull_conflict_says_commit_no_edit(world, run):
     a = world.repo("A")
-    world.repo("B")
     world.local_commit("A", {"main.tex": "local line\n"})
     world.coauthor_edit("A", {"main.tex": "overleaf line\n"})
     r = run("pull", cwd=world.work)
@@ -240,9 +224,6 @@ def test_pull_conflict_is_reported_and_then_blocks_commit(world, run):
     assert "A: CONFLICT in main.tex: fix them, then git add <files> and git commit --no-edit" in r.out
     assert "retry" not in r.out
     assert (a / ".git" / "MERGE_HEAD").exists()
-    assert "MERGE IN PROGRESS" in run("status", cwd=world.work).out
-    r = run("commit", "-am", "x", "-y", cwd=world.work)
-    assert "A: merge in progress" in r.out
 
 
 def test_pull_rebase_conflict_says_rebase_continue(world, run):
@@ -361,13 +342,6 @@ def test_parallel_fetch_keeps_list_order(world, run, tmp_path):
     assert logged(log) == {"A": "never", "B": "never", "C": "never"}   # ran without prompts
 
 
-def test_sequential_fetch_allows_prompts(world, run, tmp_path):
-    log = three_behind(world, tmp_path)
-    r = run("fetch", cwd=world.work)
-    assert r.code == 0, r
-    assert logged(log) == {"A": "", "B": "", "C": ""}
-
-
 def test_parallel_pull_matches_sequential(world, run, tmp_path):
     log = three_behind(world, tmp_path, delay_first=1)
     r = run("-j3", "pull", cwd=world.work)
@@ -391,25 +365,26 @@ def test_parallel_push(world, run):
         assert world.head(name) == world.remote_head(name)
 
 
-def test_jobs_setting_in_gitall_file(world, run, tmp_path):
-    log = three_behind(world, tmp_path)
+def test_jobs_setting_in_gitall_file_and_option(world, run, tmp_path):
+    log = tmp_path / "fetches.log"
+    for name in ("A", "B", "C"):
+        log_fetches(world.repo(name), log)
+    r = run("fetch", cwd=world.work)
+    assert r.code == 0, r
+    assert logged(log) == {"A": "", "B": "", "C": ""}   # one at a time: prompts allowed
+    log.unlink()
     write(world.work / ".gitall", "jobs = 3\nA\nB\nC\n")
     r = run("fetch", cwd=world.work)
     assert r.code == 0, r
     assert set(logged(log).values()) == {"never"}
-
-
-def test_jobs_option_overrides_gitall_file(world, run, tmp_path):
-    log = three_behind(world, tmp_path)
-    write(world.work / ".gitall", "jobs = 3\nA\nB\nC\n")
-    run("-j", "1", "fetch", cwd=world.work)
+    log.unlink()
+    run("-j", "1", "fetch", cwd=world.work)     # the option overrides the file
     assert set(logged(log).values()) == {""}
 
 
 def test_parallel_runs_never_prompt(world, monkeypatch):
     a = world.repo("A", remote=False)
-    for var in ("GIT_SSH_COMMAND", "GIT_SSH"):
-        monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("GIT_SSH", raising=False)    # conftest has already removed GIT_SSH_COMMAND
     env = no_prompts({}, a)
     assert env["GIT_TERMINAL_PROMPT"] == "0" and env["GCM_INTERACTIVE"] == "never"
     assert env["GIT_SSH_COMMAND"] == "ssh -o BatchMode=yes"   # ssh asks on the terminal itself

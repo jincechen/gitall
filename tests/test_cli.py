@@ -9,9 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import gitall as gitall_module
-from conftest import ROOT, git, write
 import gitall
+from conftest import ROOT, git, write
 from gitall import Res, Run
 
 
@@ -53,7 +52,7 @@ def test_version_shows_gitalls_then_gits_once(world, run, argv):
     r = run(*argv, cwd=world.work)
     assert r.code == 0, r
     lines = r.out.splitlines()
-    assert lines[0] == f"gitall {gitall_module.__version__}" and r.out.count("gitall ") == 1
+    assert lines[0] == f"gitall {gitall.__version__}" and r.out.count("gitall ") == 1
     assert r.out.count("git version") == 1
 
 
@@ -74,16 +73,12 @@ def test_list_respects_selection(world, run):
     assert r.out.startswith("2 of 3 repo(s)")
 
 
-def test_yes_after_the_git_command(world, run):
+def test_yes_after_the_git_command_only_as_the_last_argument(world, run):
     world.repo("A")
     r = run("tag", "v1", "-y", cwd=world.work, tty=False)
     assert r.code == 0, r
     assert "done in 1 repo" in r.out
     assert git(world.work / "A", "tag") == "v1"
-
-
-def test_yes_is_only_taken_as_the_last_argument(world, run):
-    world.repo("A")
     r = run("-y", "tag", "-a", "v2", "-m", "-y", cwd=world.work)  # -y is the message here
     assert r.code == 0, r
     assert git(world.work / "A", "tag", "-n1", "-l", "v2").split() == ["v2", "-y"]
@@ -190,7 +185,6 @@ def test_gitall_file_that_is_not_utf8(world, run):
     assert "  1  A  " in r.out and "is not a git repo" in r.err
 
 
-@pytest.mark.skipif(os.name == "nt", reason="git's colour rules for POSIX terminals")
 def test_colour_follows_git(world, run, monkeypatch):
     world.repo("A", remote=False)   # "local only" is shown in yellow
     monkeypatch.setattr(gitall, "TTY", True)
@@ -206,7 +200,7 @@ def test_colour_follows_git(world, run, monkeypatch):
 def test_closed_pipe_exits_quietly(world, run_script):
     for i in range(30):
         world.repo(f"R{i}", {f"f{j}.tex": "x\n" for j in range(30)}, remote=False)
-    p = subprocess.Popen([os.sys.executable, str(ROOT / "gitall.py"), "ls-files"], cwd=world.work,
+    p = subprocess.Popen([sys.executable, str(ROOT / "gitall.py"), "ls-files"], cwd=world.work,
                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     p.stdout.read(10)
     p.stdout.close()

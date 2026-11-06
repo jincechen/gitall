@@ -19,6 +19,7 @@ from gitall import absolutize, branch_plan, commit_opens_editor, interactive, re
     ("tag", ["-n"], True),
     ("tag", ["-n5"], True),
     ("tag", ["--contains", "HEAD"], True),
+    ("tag", ["--sort", "-v:refname"], True),
     ("tag", ["v1"], False),
     ("tag", ["-a", "v1", "-m", "x"], False),
     ("tag", ["-d", "v1"], False),
@@ -47,6 +48,7 @@ from gitall import absolutize, branch_plan, commit_opens_editor, interactive, re
     ("lfs", ["ls-files"], True),
     ("lfs", ["pull"], False),
     ("log", ["-p"], True),
+    ("bisect", ["log"], True),
     ("fetch", [], True),
     ("checkout", ["main"], False),
     ("reset", ["--hard"], False),
@@ -61,6 +63,8 @@ from gitall import absolutize, branch_plan, commit_opens_editor, interactive, re
     ("branch", ["--list", "feat*"], True),
     ("branch", ["--contains", "HEAD"], True),
     ("branch", ["--merged", "main"], True),
+    ("branch", ["--sort", "-committerdate"], True),
+    ("branch", ["--format", "%(refname)"], True),
     ("branch", ["feature"], False),
     ("branch", ["-d", "feature"], False),
     ("branch", ["-rd", "origin/x"], False),
@@ -114,9 +118,9 @@ def test_read_only(cmd, args, expected):
     ("tag", ["-a", "v1", "-mx"], False),
     ("tag", ["-a", "v1", "-F", "msg.txt"], False),
     ("tag", ["v1"], False),
-    ("commit", ["-p"], True),
-    ("commit", ["--interactive"], True),
-    ("commit", ["-i", "x"], False),            # -i is --include, not interactive
+    ("clean", ["-di"], True),                  # combined short options
+    ("add", ["-Ap"], True),
+    ("tag", ["-m", "-e", "v1"], False),        # -e is the message here
     ("pull", ["--rebase=interactive"], True),
     ("pull", ["--rebase"], False),
     ("notes", ["edit"], True),
@@ -208,6 +212,8 @@ def test_absolutize_makes_file_options_relative_to_the_start():
     here = os.path.join(start, "msg.txt")
     assert absolutize("commit", ["-F", "msg.txt"], start) == ["-F", here]
     assert absolutize("commit", ["-Fmsg.txt"], start) == ["-F" + here]
+    assert absolutize("commit", ["-aFmsg.txt"], start) == ["-aF" + here]
+    assert absolutize("commit", ["-e", "-F", "msg.txt"], start) == ["-e", "-F", here]
     assert absolutize("commit", ["--file=msg.txt"], start) == ["--file=" + here]
     assert absolutize("commit", ["-F", "-"], start) == ["-F", "-"]              # stdin
     assert absolutize("archive", ["-o", "out.zip", "HEAD"], start) == ["-o", os.path.join(start, "out.zip"), "HEAD"]
@@ -218,6 +224,8 @@ def test_absolutize_makes_file_options_relative_to_the_start():
 def test_absolutize_leaves_everything_else_alone():
     start = os.path.abspath("start")
     for cmd, args in [("commit", ["-m", "-Fx is a message"]), ("commit", ["-m", "-t foo"]),
+                      ("commit", ["--message", "-Fix"]), ("commit", ["-e", "-m", "-Fix"]),
+                      ("commit", ["-am", "-Fix typo"]), ("commit", ["-am", "-tidy up"]),
                       ("commit", ["-am", "x"]), ("commit", ["-m", "x", "--", "-F"]),
                       ("log", ["-o", "x"]), ("branch", ["-t", "origin/x"]),
                       ("commit", ["-F", os.path.join(start, "abs.txt")])]:

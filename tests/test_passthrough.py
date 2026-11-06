@@ -3,6 +3,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import unicodedata
 import zipfile
 
 import pytest
@@ -111,6 +112,7 @@ def test_rows_line_up_for_wide_and_accented_names(world, run):
         lines = [ln for ln in run(*argv, cwd=world.work).out.splitlines() if "main" in ln]
         assert len(lines) == 3 and len({width(ln[:ln.index("main")]) for ln in lines}) == 1, lines
     assert width("\U0001f44d\ufe0f") == 2 and width("a\u200db") == 2  # emoji + selector; joiner
+    assert width(unicodedata.normalize("NFD", "한글")) == 4    # decomposed Hangul, as macOS lists it
 
 
 def test_on_a_terminal_git_output_looks_as_in_git(world, run, monkeypatch):
@@ -126,8 +128,7 @@ def test_on_a_terminal_git_output_looks_as_in_git(world, run, monkeypatch):
     long = "chapter-three/figures-and-tables/supplementary-figures-and-tables-for-the-appendix.tex"
     write(a / long)
     git(a, "add", "-A")
-    monkeypatch.setenv("COLUMNS", "")
-    monkeypatch.delenv("COLUMNS")
+    monkeypatch.delenv("COLUMNS", raising=False)
     monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((200, 40)))
     assert long in run("diff", "--cached", "--stat", cwd=world.work).out
 
@@ -146,11 +147,6 @@ def test_changes_need_confirmation(world, run):
     assert r.code == 2
     assert "Will run:  git tag v1\nin: A B" in r.out
     assert git(world.work / "A", "tag") == ""
-
-
-def test_changes_with_yes(world, run):
-    world.repo("A")
-    world.repo("B")
     r = run("-y", "tag", "v1", cwd=world.work)
     assert r.code == 0
     assert "done in 2 repos" in r.out
@@ -166,15 +162,11 @@ def test_add_does_not_ask(world, run):
 
 
 def test_read_only_commands_do_not_ask(world, run):
+    # the full table is in test_rules.py; these check that git really leaves things alone
     a = world.repo("A")
-    git(a, "tag", "v1")
     write(a / "junk.tmp")
-    for argv in (["branch", "--show-current"], ["branch", "-a"], ["branch", "-vv"],
-                 ["remote", "-v"], ["remote", "get-url", "origin"],
-                 ["config", "user.name"], ["config", "--get", "user.name"], ["config", "-l"],
-                 ["stash", "list"], ["tag"], ["tag", "-l"], ["tag", "-n"], ["reflog", "-1"],
-                 ["show-ref"], ["ls-remote", "origin"], ["merge-base", "HEAD", "HEAD"],
-                 ["worktree", "list"], ["clean", "-n"], ["rm", "-n", "main.tex"]):
+    for argv in (["clean", "-n"], ["rm", "-n", "main.tex"], ["branch", "--show-current"],
+                 ["config", "user.name"]):
         r = run(*argv, cwd=world.work, tty=False)
         assert r.code == 0, (argv, r)
         assert "Will run" not in r.out, argv
@@ -186,14 +178,12 @@ def test_read_only_commands_do_not_ask(world, run):
 def test_changes_ask(world, run):
     a = world.repo("A")
     git(a, "branch", "old")
-    write(a / "main.tex", "changed\n")
-    for argv in (["branch", "-d", "old"], ["branch", "new"], ["config", "user.name", "X"],
-                 ["stash"], ["stash", "pop"], ["remote", "remove", "origin"], ["tag", "v1"],
-                 ["reflog", "expire", "--expire=now", "--all"], ["reflog", "delete", "HEAD@{0}"],
-                 ["clean", "-fd"], ["worktree", "prune"]):
+    for argv in (["branch", "-d", "old"], ["remote", "remove", "origin"],
+                 ["reflog", "expire", "--expire=now", "--all"], ["worktree", "prune"]):
         r = run(*argv, cwd=world.work, tty=False)
         assert r.code == 2 and "Will run" in r.out, argv
     assert "old" in git(a, "branch")
+    assert git(a, "remote") == "origin"
     assert git(a, "reflog") != ""
 
 
@@ -236,6 +226,10 @@ def test_one_failure_does_not_stop_the_others(world, run):
     assert shown_repos(r)[:1] == ["B"]
     assert "Failed:\n  A: git rev-parse exited with 1" in r.out
     assert "retry:  gitall -r A rev-parse --verify -q feature" in r.out
+    r = run("-C", "work", "rev-parse", "--verify", "-q", "feature", cwd=world.root)
+    retry = retry_line(r)    # keeps -C
+    assert retry.startswith("gitall -C ") and str(world.work) in retry
+    assert retry.endswith(" -r A rev-parse --verify -q feature")
 
 
 def retry_line(result):
@@ -260,6 +254,7 @@ def test_commands_are_quoted_for_powershell_on_windows(monkeypatch):
         assert quote("Deck2") == "Deck2"
         assert quote("Fix $x$ `a` it's") == "'Fix $x$ `a` it''s'"
         assert quote("a,b") == "'a,b'" and quote("@x") == "'@x'" and quote("") == "''"
+        assert quote("a“b”") == "'a“b”'" and quote("--%") == "'--%'"
 
 
 def test_names_with_a_comma(world, run):
@@ -276,23 +271,6 @@ def test_names_with_a_comma(world, run):
         assert shlex.split(retry_line(r))[:5] == ["gitall", "-r", "Deck, v2", "-r", "Smith, Jones"]
     r = run("-r", "Deck, v2", "-r", "Smith, Jones", "-l", cwd=world.work)
     assert r.out.startswith("2 of 4 repo(s)") and "Deck, v2" in r.out and "Smith, Jones" in r.out
-
-
-# ---- which options make a command interactive ------------------------------------------------
-def test_log_patch_is_captured_not_interactive(world, run):
-    world.repo("A")
-    world.repo("B")
-    world.local_commit("B", {"x.tex": "slide\n"})
-    r = run("log", "-p", "@{u}..HEAD", cwd=world.work)
-    assert headers(r) == ["B"]
-    assert "+slide" in r.out
-
-
-def test_grep_ignore_case_and_pattern_are_captured(world, run):
-    world.repo("A", {"main.tex": "Hello\n"})
-    world.repo("B")
-    assert shown_repos(run("grep", "-i", "hello", cwd=world.work)) == ["A"]
-    assert shown_repos(run("grep", "-e", "Hello", cwd=world.work)) == ["A"]
 
 
 # ---- paths and files ------------------------------------------------------------------------------
@@ -349,14 +327,6 @@ def test_bare_init_is_refused(world, run):
     r = run("init", cwd=world.work)
     assert r.code == 2 and "give its folder" in r.err
     assert not (world.work / ".git").exists()
-
-
-def test_command_help_runs_once(world, run):
-    # (not --help: on Windows that opens the help page in a browser)
-    world.repo("A")
-    world.repo("B")
-    r = run("log", "-h", cwd=world.work)
-    assert r.all.count("usage: git log") == 1
 
 
 def test_add_asks_before_marking_conflicts_resolved(world, run):

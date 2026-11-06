@@ -11,7 +11,7 @@ arguments mean what they mean in git. A few commands get extra help:
   commit          previews each repo's commit and asks once; repos with nothing to
                   commit are skipped; without -m you write one message for all repos
   push            only repos with unpushed commits; previews them and asks once
-  pull            one line per repo: fast-forward, merged, up to date or CONFLICT
+  pull            one line per repo: fast-forward, merged, rebased, up to date or CONFLICT
   fetch           one line per repo: what came in, then ahead/behind
   switch/checkout <branch>
                   previews which repos have the branch, asks once; the others are skipped
@@ -76,8 +76,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 __version__ = "1.0.0.dev0"
-# rename the file and the messages and config file follow; a link to it (ga, or git-all for
-# "git all") gives the name used in messages, and still reads the file's own config, .gitall
+# the file's (or a link's) name names the tool; the config file follows the file's own name
 PROG = Path(__file__).stem
 CONFIG = f".{Path(__file__).resolve().stem}"
 
@@ -90,7 +89,7 @@ READ_ONLY = {
     "merge-base", "cherry", "diff-tree", "diff-files", "diff-index", "var", "verify-commit",
     "verify-tag", "fsck",
 }
-NO_CONFIRM = READ_ONLY | {"add", "pull"}
+NO_CONFIRM = READ_ONLY | {"add"}
 # commands with their own handling, and other common built-ins: never looked up as aliases
 COMMON = READ_ONLY | {
     "add", "pull", "push", "commit", "switch", "checkout", "branch", "merge", "rebase", "reset",
@@ -107,8 +106,20 @@ INTERACTIVE = {
     "stash": {"-p", "--patch"}, "clean": {"-i", "--interactive"}, "rebase": {"-i", "--interactive"},
     "merge": {"-e", "--edit"}, "revert": {"-e", "--edit"}, "cherry-pick": {"-e", "--edit"},
     "tag": {"-e", "--edit"}, "config": {"-e", "--edit"}, "am": {"-i", "--interactive"},
-    "commit": {"-p", "--patch", "--interactive"},
     "pull": {"--rebase=interactive", "--rebase=i", "-r=i", "-ri"},
+}
+# options whose value is the next argument, for telling values from refspecs, URLs and paths
+WORD_VALUES = {
+    "push": {"-o", "--push-option", "--repo", "--receive-pack", "--exec"},
+    "pull": {"-X", "--strategy-option", "-s", "--strategy", "--depth", "--deepen", "--shallow-since",
+             "--shallow-exclude", "-j", "--jobs", "-o", "--server-option", "--upload-pack",
+             "--negotiation-tip", "--cleanup"},
+    "init": {"-b", "--initial-branch", "--template", "--separate-git-dir", "--object-format",
+             "--ref-format"},
+    "clone": {"-b", "--branch", "-o", "--origin", "-c", "--config", "--depth", "--reference",
+              "--reference-if-able", "--separate-git-dir", "--template", "-u", "--upload-pack",
+              "--shallow-since", "--shallow-exclude", "-j", "--jobs", "--filter", "--server-option",
+              "--bundle-uri", "--ref-format"},
 }
 # branch options that create, delete, rename or configure branches, and ones that list them
 BRANCH_CHANGES = {"--delete", "--move", "--copy", "--set-upstream-to", "--unset-upstream",
@@ -136,7 +147,7 @@ SHORT_VALUES = {"commit": "mFCct", "tag": "mFu", "merge": "mF", "notes": "mFCc",
                 "archive": "o", "format-patch": "o"}
 LONG_VALUES = {"--message", "--file", "--template", "--author", "--date", "--trailer", "--cleanup",
                "--format", "--pretty", "--grep", "--reuse-message", "--reedit-message", "--fixup",
-               "--squash", "--output", "--output-directory"}
+               "--squash", "--output", "--output-directory", "--pathspec-from-file"}
 # branch/tag options whose value is the next argument (branch --sort -committerdate)
 LIST_VALUES = {"--sort", "--format", "--contains", "--no-contains", "--merged", "--no-merged",
                "--points-at", "-u", "--set-upstream-to", "-m", "--message", "-F", "--file"}
@@ -164,12 +175,10 @@ _colour = []
 
 
 def use_colour():
-    """Whether to colour output: on a terminal, unless NO_COLOR is set or, on POSIX, git itself
-    wouldn't (color.ui=never, TERM=dumb)."""
+    """Whether to colour output: on a terminal, unless NO_COLOR is set or git itself wouldn't
+    (color.ui=never, TERM=dumb)."""
     if not TTY or NO_COLOR:
         return False
-    if os.name == "nt":
-        return True
     if not _colour:
         try:
             p = subprocess.run(["git", *USER_OPTS, "config", "--get-colorbool", "color.ui", "true"],
@@ -237,9 +246,10 @@ def quote(arg):
     PowerShell, so that a printed command can be pasted back as is ($ and ` stay literal)."""
     if os.name != "nt":
         return shlex.quote(arg)
-    if arg and not re.search(r"[\s\"'$`!&|<>;(){}*?\[\]\\,@#‘-‛]", arg):
+    # PowerShell also takes curly quotes as quotes; in '...' only the single ones need doubling
+    if arg and arg != "--%" and not re.search("[\\s\"'$`!&|<>;(){}*?\\[\\]\\\\,@#‘-„]", arg):
         return arg
-    return "'" + re.sub(r"(['‘-‛])", r"\1\1", arg) + "'"
+    return "'" + re.sub("(['‘-‛])", r"\1\1", arg) + "'"
 
 
 def shown(args):
@@ -250,7 +260,8 @@ def width(text):
     """The columns text takes in a terminal: CJK characters take two; accents and other
     zero-width characters (joiners, variation selectors) none."""
     return sum(0 if unicodedata.category(ch) in ("Mn", "Me", "Cf")
-               else 2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+               else 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+               for ch in unicodedata.normalize("NFC", text))   # macOS names come decomposed
 
 
 def pad(text, n):
@@ -416,15 +427,16 @@ def natural(name):
 
 
 def key(path):
-    """What makes two paths the same folder. On POSIX that's the folder itself, however the
-    path spells it (symlinks; case and Unicode form on macOS); on Windows the normalized path."""
+    """What makes two paths the same folder, however the path spells it: on POSIX the folder
+    itself (symlinks; case and Unicode form on macOS), on Windows its real path (links and
+    junctions resolved) in any case."""
     if os.name != "nt":
         try:
             st = os.stat(path)
             return st.st_dev, st.st_ino
         except OSError:
             pass
-    return os.path.normcase(os.path.abspath(path))
+    return os.path.normcase(os.path.realpath(path))
 
 
 def fold(name):
@@ -454,12 +466,18 @@ def git_dir(path):
     return None
 
 
+def common_dir(gd):
+    """The .git folder a git dir shares refs and logs with: a linked worktree's git dir
+    (.git/worktrees/<name>) shares the main repo's; any other git dir is its own."""
+    return gd.parent.parent if gd.parent.name == "worktrees" else gd
+
+
 def worktree_of(path):
     """The main repo's folder if path is a linked worktree, else None."""
     if not (path / ".git").is_file():
         return None
     d = git_dir(path)
-    return d.parent.parent.parent if d and d.parent.name == "worktrees" else None
+    return common_dir(d).parent if d and common_dir(d) != d else None
 
 
 def subdirs(d):
@@ -530,9 +548,8 @@ class State:
                 self.untracked += 1
                 self.files.append(f"?? {line[2:]}")
         if not self.stash and gd:   # git before 2.35 doesn't report stashes: count stash's reflog
-            common = gd.parent.parent if gd.parent.name == "worktrees" else gd
             try:
-                self.stash = len((common / "logs" / "refs" / "stash").read_bytes().splitlines())
+                self.stash = len((common_dir(gd) / "logs" / "refs" / "stash").read_bytes().splitlines())
             except OSError:
                 pass
 
@@ -544,6 +561,13 @@ class State:
     def tracking(self):
         """Has an upstream branch that exists (as of the last fetch)."""
         return bool(self.upstream) and not self.gone
+
+    @property
+    def no_upstream(self):
+        """Why there's no upstream to push to or pull from, or None."""
+        if not self.tracking:
+            return "its upstream branch is gone" if self.upstream else "no upstream branch"
+        return None
 
     def problem(self, detached_ok=False):
         """Why it isn't safe to commit/pull/push here right now, or None."""
@@ -603,7 +627,7 @@ class State:
 
     def fetched(self):
         """Seconds since the last fetch, or None if never."""
-        for d in (self.gitdir, self.gitdir and self.gitdir.parent.parent):
+        for d in (self.gitdir, self.gitdir and common_dir(self.gitdir)):
             if d and (d / "FETCH_HEAD").exists():
                 return time.time() - (d / "FETCH_HEAD").stat().st_mtime
         return None
@@ -702,8 +726,12 @@ def config_entry(root, entry, listings):
             name = same[0] if len(same) == 1 else name
         return d / name
 
-    paths = [root]
-    for part in entry.split("/"):
+    start = Path(entry)
+    if start.is_absolute():
+        paths, parts = [Path(start.anchor)], start.relative_to(start.anchor).as_posix().split("/")
+    else:
+        paths, parts = [root], entry.split("/")
+    for part in parts:
         if any(ch in part for ch in GLOB_CHARS):
             pattern = unicodedata.normalize("NFC", part)
             paths = [c for d in paths for c in listing(d)
@@ -752,7 +780,7 @@ def read_config(root, cfg):
             continue
         if not hits:
             if url and not any(ch in entry for ch in GLOB_CHARS):
-                ws.missing.append((entry, url))
+                ws.missing.append((entry, url, group))
             else:
                 ws.warnings.append(f"{cfg}, line {n}: '{entry}' is not a git repo, left out")
             continue
@@ -834,6 +862,10 @@ def select(ws, picks, drops):
         if any(spec.strip().lstrip("!") in (r.name, r.folder) for r in ws.repos):
             return [spec.strip()]
         return [t.strip() for t in spec.split(",")]
+    for flag, specs in (("-r", picks), ("-x", drops)):
+        for spec in specs:
+            if not any(terms(spec)):    # -r "$REPOS" with nothing in it must not mean all repos
+                die(f"{flag} {quote(spec)} names no repo")
     names, states, excluded = [], [], []
     for spec in picks:
         for term in terms(spec):
@@ -936,11 +968,37 @@ def interactive(cmd, args):
             not any(a in ("-m", "-F", "--message", "--file") or a.startswith(("-m", "-F", "--message=", "--file="))
                     for a in args):
         return True  # annotated tag without a message: git opens an editor
-    return bool(INTERACTIVE.get(cmd, set()) & set(args))
+    return bool(INTERACTIVE.get(cmd, set()) & split_args(cmd, args)[0])
 
 
-COMMIT_VALUE = {"message", "file", "reuse-message", "reedit-message", "fixup", "squash", "template",
-                "author", "date", "cleanup", "trailer", "pathspec-from-file"}
+def split_args(cmd, args):
+    """(options, words) in git <cmd> <args>. Options as typed, also by name without =value, and
+    each letter of a cluster (-di: -d, -i); words: everything else (refspecs, URLs, paths).
+    An option's value is neither."""
+    takes = WORD_VALUES.get(cmd, set()) | LONG_VALUES
+    letters = SHORT_VALUES.get(cmd, "") + "".join(o[1] for o in takes if len(o) == 2)
+    opts, words, i = set(), [], 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            words += args[i:]
+            break
+        if a.startswith("--"):
+            opts |= {a, a.split("=", 1)[0]}
+            if "=" not in a and a in takes and i < len(args):
+                i += 1
+        elif a.startswith("-") and len(a) > 1:
+            opts.add(a)
+            for k, ch in enumerate(a[1:], 2):
+                opts.add("-" + ch)
+                if ch in letters:       # takes a value: the rest of the word, or the next word
+                    if k == len(a) and i < len(args):
+                        i += 1
+                    break
+        else:
+            words.append(a)
+    return opts, words
 
 
 def commit_options(args):
@@ -954,7 +1012,7 @@ def commit_options(args):
             break
         if a.startswith("--"):
             name, eq, value = a[2:].partition("=")
-            if not eq and name in COMMIT_VALUE and i < len(args):
+            if not eq and f"--{name}" in LONG_VALUES and i < len(args):
                 value, i = args[i], i + 1
             opts[name] = value
         elif a.startswith("-") and len(a) > 1:
@@ -963,7 +1021,7 @@ def commit_options(args):
                 if ch in "Su":  # optional value, only in this word (-S<keyid>, -u<mode>)
                     opts[ch] = a[j:]
                     break
-                if ch in "mFCct":  # takes a value: the rest of this word, or the next word
+                if ch in SHORT_VALUES["commit"]:  # the rest of this word, or the next word
                     opts[ch] = a[j:]
                     if j == len(a) and i < len(args):
                         opts[ch], i = args[i], i + 1
@@ -1083,7 +1141,10 @@ def resolve_alias(cmd, args, cwd):
         chain.append(f"{cmd} = {val}")
         if val.startswith("!"):
             return cmd, args, "shell", chain
-        parts = shlex.split(val)
+        try:
+            parts = shlex.split(val)
+        except ValueError as e:     # an unclosed quote
+            die(f"bad alias.{cmd} string: {str(e).lower()}")
         if not parts:
             break
         cmd, args = parts[0], parts[1:] + args
@@ -1265,10 +1326,7 @@ class Run:
             for r, msg, _ in self.failed:
                 by_msg.setdefault(msg, []).append(r)
             for msg, rs in by_msg.items():
-                if len(rs) == 1:
-                    out(f"  {rs[0].name}: {msg}")
-                else:
-                    out(f"  {', '.join(r.name for r in rs)}: {msg}")
+                out(f"  {', '.join(r.name for r in rs)}: {msg}")
             by_retry = {}
             for r, _, retry in self.failed:
                 if retry is not False:
@@ -1359,26 +1417,23 @@ class Run:
                     r._state = s
         load_states(self.repos)
         bwidth = min(30, max(width(branch_text(r.state)) for r in self.repos))
-        details = []
+        shown = [r for r in self.repos if not self.o.quiet or r.state.error or r.state.dirty or
+                 not r.state.tracking or r.state.ahead or r.state.behind or r.state.op or
+                 r.state.locked or r.state.detached]
         for r in self.repos:
-            s = r.state
-            if s.error:
-                self.fail(r, s.error)
-            busy = s.dirty or not s.tracking or s.ahead or s.behind or s.op or s.locked or s.detached
-            if self.o.quiet and not busy:
-                continue
+            if r.state.error:
+                self.fail(r, r.state.error)
+        for r in shown:
             out(repo_row(r, self.width, bwidth))
-            if s.files:
-                details.append(r)
-        if self.o.quiet and not details and not self.failed and \
-                not any(r.state.ahead or r.state.behind or not r.state.tracking for r in self.repos):
+        if not shown:
             out(f"all {plural(len(self.repos), 'repo')} clean")
-        for r in details:
+        for r in (r for r in shown if r.state.files):
             header(r.name)
             files = r.state.files
             out("\n".join(files[:STATUS_FILES]))
             if len(files) > STATUS_FILES + 1:
-                out(f"... and {len(files) - STATUS_FILES} more ({PROG} -r {quote(r.name)} status -s)")
+                out(f"... and {len(files) - STATUS_FILES} more "
+                    f"({self.command_line([r], ['status', '-s'])})")
             elif len(files) == STATUS_FILES + 1:
                 out(files[-1])
         ages = [(r.state.fetched(), r) for r in self.repos if r.state.tracking]
@@ -1397,10 +1452,10 @@ class Run:
         live_commit = bool({"p", "patch", "interactive"} & opts.keys())
         anything = live_commit or bool({"amend", "allow-empty"} & opts.keys())
         fixup = opts.get("fixup", "")
-        repo_editor = commit_opens_editor(args) and (
-            bool({"amend", "c", "reedit-message", "e", "edit", "squash"} & opts.keys())
-            or fixup.startswith(("amend:", "reword:")))
-        one_editor = commit_opens_editor(args) and not repo_editor and not live_commit
+        editor = commit_opens_editor(args)
+        repo_editor = editor and (bool({"amend", "c", "reedit-message", "e", "edit", "squash"} & opts.keys())
+                                  or fixup.startswith(("amend:", "reword:")))
+        one_editor = editor and not repo_editor and not live_commit
         templated = any(PLACEHOLDER.search(a) for a in args)
         todo, previews, unmatched = [], [], []
         for r, rargs in self.plan(args):
@@ -1432,9 +1487,11 @@ class Run:
                 out(f"   amends: {git_ok(r.path, 'log', '-1', '--format=%h %s') or '?'}")
                 if s.tracking and s.ahead == 0:
                     out(YELLOW("   ! that commit is already pushed: you'd need to force-push"))
-            msg = commit_options(rargs).get("m") or commit_options(rargs).get("message")
-            if templated and msg is not None:
-                out(f"   message: {msg}")
+            if templated:
+                ropts = commit_options(rargs)
+                msg = ropts.get("m") or ropts.get("message")
+                if msg is not None:
+                    out(f"   message: {msg}")
         if not todo:
             if unmatched and not self.failed and len(unmatched) + len(self.skipped) == len(self.repos):
                 die(f"{unmatched[0]} (in any of the repos)", 1)
@@ -1506,8 +1563,7 @@ class Run:
 
     # -- push
     def push(self, args):
-        words = [a for a in args if not a.startswith("-")]
-        opts = {a.split("=", 1)[0] for a in args if a.startswith("-")}
+        opts, words = split_args("push", args)
         dry = bool({"-n", "--dry-run"} & opts)
         force = bool({"-f", "--force", "--force-with-lease"} & opts) or any(w.startswith("+") for w in words)
         plain = not words and not opts & {"--tags", "--follow-tags", "--all", "--mirror", "--branches",
@@ -1521,20 +1577,26 @@ class Run:
                     self.skip(r, "no commits yet")
                     continue
                 if not s.tracking:
+                    if not s.remotes:
+                        self.skip(r, "no remote to push to (git remote add origin <URL>)")
+                        continue
                     if setup is None:
                         setup = git_ok(r.path, "config", "--type=bool", "push.autoSetupRemote") == "true" \
                             and git_version()[1] >= (2, 37)     # older git ignores the setting
                     if s.upstream or not setup:
-                        why = "its upstream branch is gone" if s.upstream else "no upstream branch"
-                        self.skip(r, f"{why} (to publish it: {PROG} -r {quote(r.name)} push -u origin HEAD)")
+                        publish = self.command_line([r], ["push", "-u", "origin", "HEAD"])
+                        self.skip(r, f"{s.no_upstream} (to publish it: {publish})")
                         continue
                     header(f"{r.name} ({s.branch}, new on the remote)")
-                elif not s.ahead:
+                elif not s.ahead and not (force and s.behind):
                     self.count("up to date", r)
                     continue
                 else:
                     header(f"{r.name} ({branch_text(s)}, {sync_text(s)})")
                     out(git_ok(r.path, "log", "--format=  %h %s", "@{u}..HEAD") or "")
+                    if force and s.behind:
+                        out(YELLOW("  replaces these commits on the remote:"))
+                        out(git_ok(r.path, "log", "--format=  - %h %s", "HEAD..@{u}") or "")
             todo.append((r, rargs))
         if not todo:
             out("nothing to push")
@@ -1560,13 +1622,22 @@ class Run:
             refs = [ln.split("\t") for ln in res.out.splitlines() if ln.count("\t") >= 2]
             if any(f == "!" for f, _, _ in refs) or (res.rc and re.search(r"rejected|fetch first", res.err)):
                 why = next((summary for f, _, summary in refs if f == "!"), "")
-                out(f"{r.name}: {RED('rejected')} {why.replace('[rejected]', '').strip()}".rstrip())
-                if "non-fast-forward" in why and replaced_pushed_commits(r.path):
+                reason = re.sub(r"^\[[^]]*\]\s*", "", why).strip("() ")    # "[rejected] (fetch first)"
+                out(f"{r.name}: {RED('rejected')}" + (f" ({reason})" if reason else ""))
+                said = [ln for ln in res.err.splitlines() if ln.startswith("remote:")]
+                if said:
+                    out(indent("\n".join(said)))
+                if reason == "non-fast-forward" and replaced_pushed_commits(r.path):
                     self.fail(r, "rejected: you amended or rebased commits that were already pushed (if no "
                                  "one else has pushed since, replace them with --force-with-lease)",
                               ["push", "--force-with-lease"])
-                else:
+                elif reason in ("", "fetch first", "non-fast-forward"):
                     self.fail(r, "rejected: the remote has newer commits (pull first, then push again)", ["pull"])
+                elif reason == "stale info":
+                    self.fail(r, "rejected: the remote changed since your last fetch (fetch and look first)",
+                              ["fetch"])
+                else:
+                    self.fail(r, f"rejected: {reason}" + (" (see the remote's message above)" if said else ""))
             elif res.rc:
                 out(f"{r.name}: {RED('push failed')}")
                 out(indent("\n".join(t for t in (res.out, res.err) if t)))
@@ -1587,12 +1658,11 @@ class Run:
     # -- pull
     def pull(self, args):
         live = interactive("pull", args)
-        words = [a for a in args if not a.startswith("-")]
+        words = split_args("pull", args)[1]
         todo = []
         for r, rargs in self.plan(args):
             if not words and not r.state.tracking:
-                why = "its upstream branch is gone" if r.state.upstream else "no upstream branch"
-                self.skip(r, f"{why}, nothing to pull from")
+                self.skip(r, f"{r.state.no_upstream}, nothing to pull from")
                 continue
             todo.append((r, rargs))
         rargs_of, uptodate = dict(todo), []
@@ -1655,8 +1725,10 @@ class Run:
 
     # -- switch / checkout <branch>
     def switch(self, cmd, args):
-        if branch_plan(cmd, args) is None:
+        plan = branch_plan(cmd, args)
+        if plan is None:
             return self.passthrough(cmd, args)
+        action, target = plan[0], plan[1]
         plans = {r: (rargs, branch_plan(cmd, rargs)) for r, rargs in self.plan(args, detached_ok=True)}
         if not plans:
             self.finish()
@@ -1664,7 +1736,7 @@ class Run:
         for r, (rargs, p) in plans.items():
             s, branch = r.state, p[1]
             local, _, _ = s.refs()
-            if p[0] == "create":
+            if action == "create":
                 kind = "create" if p[2] or branch not in local else None
                 if kind is None:
                     self.skip(r, f"already has a branch '{branch}'")
@@ -1680,11 +1752,10 @@ class Run:
             groups.setdefault(kind, []).append(r)
             if kind and kind != "already on it":
                 todo.append((r, rargs))
-        if p[0] == "switch" and None in groups and len(groups) == 1:
-            self.skipped = []
-            return self.passthrough(cmd, args)  # no repo has such a branch: a tag, a commit, a path
-        target = branch_plan(cmd, args)[1]
-        out(f"{'create' if p[0] == 'create' else 'switch to'} {target}:")
+        if action == "switch" and None in groups and len(groups) == 1:
+            self.skipped, self.failed = [], []      # passthrough reports those itself
+            return self.passthrough(cmd, args)      # no repo has such a branch: a tag, a commit, a path
+        out(f"{'create' if action == 'create' else 'switch to'} {target}:")
         order = ["create", "switch"] + sorted(k for k in groups if k and k.startswith("new")) + ["already on it", None]
         for kind, rs in sorted(groups.items(), key=lambda kv: order.index(kv[0])):
             names = " ".join(r.name + ("*" if r.state.dirty else "") for r in rs)
@@ -1697,7 +1768,7 @@ class Run:
         if not todo:
             out("nothing to do")
             self.finish()
-        self.ask(f"{'Create the branch in' if p[0] == 'create' else 'Switch'} {plural(len(todo), 'repo')}?")
+        self.ask(f"{'Create the branch in' if action == 'create' else 'Switch'} {plural(len(todo), 'repo')}?")
         out()
         for r, rargs in todo:
             res = git(r.path, cmd, *rargs, env=self.env(r))
@@ -1712,20 +1783,30 @@ class Run:
         self.finish(cmd)
 
     # -- clone the missing repos from .gitall
-    def clone_missing(self):
+    def clone_missing(self, args):
         if not self.ws.missing:
             note = "" if self.ws.config else f" (list them as 'name  URL' lines in a {CONFIG} file)"
             out(f"nothing to clone: no listed repo is missing{note}")
             return 0
-        for name, url in self.ws.missing:
-            out(f"  {name}  <-  {url}")
-        self.ask(f"Clone {plural(len(self.ws.missing), 'repo')} into {self.ws.root}?")
-        targets = [Repo(self.ws.root / name, self.ws.root) for name, _ in self.ws.missing]
-        url_of = {r.name: url for r, (_, url) in zip(targets, self.ws.missing)}
+        missing = Workspace(self.ws.root)       # -r and -x choose among the missing repos
+        url_of = {}
+        for name, url, group in self.ws.missing:
+            r = Repo(self.ws.root / name, self.ws.root)
+            missing.repos.append(r)
+            url_of[r] = url
+            if group:
+                missing.groups.setdefault(fold(group), (group, []))[1].append(r)
+        targets = select(missing, self.o.picks, self.o.drops)
+        if not targets:
+            out("nothing to clone")
+            return 0
+        for r in targets:
+            out(f"  {r.name}  <-  {url_of[r]}")
+        self.ask(f"Clone {plural(len(targets), 'repo')} into {self.ws.root}?")
 
         def work(r, batch):
             env = no_prompts(dict(os.environ), self.ws.root) if batch else None
-            return git(self.ws.root, "clone", url_of[r.name], r.name, env=env, batch=batch)
+            return git(self.ws.root, "clone", *args, url_of[r], r.name, env=env, batch=batch)
         for r, res in self.each(targets, work):
             if res.rc == 0:
                 out(f"{r.name}: {GREEN('cloned')}")
@@ -1829,7 +1910,9 @@ def describe_change(path, before, after):
     """'fast-forward, 3 commits, 2 files changed' and the like."""
     if not before:
         return f"pulled {plural(int(git_ok(path, 'rev-list', '--count', after) or 0), 'commit')}"
-    n = int(git_ok(path, "rev-list", "--count", f"{before}..{after}") or 0)
+    # count what came in (FETCH_HEAD), not a merge commit or your own commits rebased on top
+    came = "FETCH_HEAD" if git_ok(path, "rev-parse", "-q", "--verify", "FETCH_HEAD^{commit}") else after
+    n = int(git_ok(path, "rev-list", "--count", f"{before}..{came}") or 0)
     parents = (git_ok(path, "rev-parse", f"{after}^@") or "").split()
     if git(path, "merge-base", "--is-ancestor", before, after, internal=True).rc == 0:
         kind = "merged" if len(parents) > 1 and parents[0] == before else "fast-forward"
@@ -1872,7 +1955,7 @@ def list_repos(ws, chosen, picked):
     if ws.groups:
         out("groups: " + ", ".join(f"{name} ({len(rs)})" for name, rs in ws.groups.values()))
     if ws.missing:
-        out(f"missing ({PROG} clone gets them): " + ", ".join(name for name, _ in ws.missing))
+        out(f"missing ({PROG} clone gets them): " + ", ".join(name for name, _, _ in ws.missing))
     if ws.hidden:
         out("left out: " + ", ".join(ws.hidden))
     return 0
@@ -1960,15 +2043,14 @@ def main(argv):
 
     if cmd:
         cmd, args, kind, o.alias_chain = resolve_alias(cmd, args, o.start)
-        before_dashdash = args[:args.index("--")] if "--" in args else args
-        if cmd in ("help", "version") or args == ["-h"] or "--help" in before_dashdash:
+        opts, words = split_args(cmd, args)     # (commit -m --help is a message, not --help)
+        if cmd in ("help", "version") or args == ["-h"] or "--help" in opts:
             if cmd == "help" and not args:
                 out(usage())
                 return 0
             if cmd == "version":
                 out(f"{PROG} {__version__}")
             return subprocess.call(["git", *USER_OPTS, cmd, *args], cwd=o.start)  # once, not per repo
-        words = [a for a in args if not a.startswith("-")]
         once = (cmd == "clone" and words) or (cmd == "init" and words) or cmd.startswith("credential") or \
             (cmd == "config" and any(a in ("--global", "--system", "-f", "--file") or a.startswith("--file=")
                                      for a in args))
@@ -1983,7 +2065,7 @@ def main(argv):
     for w in ws.warnings:
         err(YELLOW(f"{PROG}: {w}"))
     if cmd == "clone":
-        return Run(ws, [], o, gitcmd).clone_missing()
+        return Run(ws, [], o, gitcmd).clone_missing(args)
     if not ws.repos and o.list and ws.missing:
         return list_repos(ws, [], False)
     if not ws.repos:
