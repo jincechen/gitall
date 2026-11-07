@@ -5,10 +5,7 @@ All notable changes to gitall are listed here. The format follows
 [Semantic Versioning](https://semver.org/): gitall's own options, the `.gitall` file, the
 `:state` words and the `{placeholders}` only change incompatibly in a new major version.
 
-<!-- Before releasing: add any further changes, set the date below, set
-     __version__ = "1.0.0" in gitall.py, then tag v1.0.0. -->
-
-## [1.0.0] - unreleased
+## [1.0.0] - 2026-11-07
 
 The first release. Type `gitall` where you would type `git`, and the command runs in every repo.
 Works on Windows, Linux and macOS, with Python 3.8+ and git 2.15+ (2.23+ for `git switch`).

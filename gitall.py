@@ -75,7 +75,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-__version__ = "1.0.0.dev0"
+__version__ = "1.0.0"
 # the file's (or a link's) name names the tool; the config file follows the file's own name
 PROG = Path(__file__).stem
 CONFIG = f".{Path(__file__).resolve().stem}"
