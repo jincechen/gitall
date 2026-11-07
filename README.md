@@ -1,175 +1,171 @@
 # gitall
 
-Run git in several repositories at once. If you know git, you already know the syntax:
-type `gitall` where you would type `git`.
+Run Git commands across multiple repositories.
 
-```
-gitall [options] <git command> [git arguments]
-```
+Working on a few projects at once? Run `gitall status` in the folder that contains
+them to see which repos need attention:
 
-```
-gitall status                      # one line per repo: branch, ahead/behind, changes
-gitall diff --stat                 # any git diff options
-gitall add -A
-gitall commit -m "Fix typos"       # shows what each repo will commit, asks once, commits
-gitall push                        # pushes repos that have unpushed commits, asks first
-gitall pull
-gitall switch {default}            # main in some repos, master in others
-gitall log -3 --oneline
-gitall stash list                  # ...any other git command works too
+```console
+$ gitall status
+api   main        ahead 2
+docs  main        1 modified
+web   feature/ui  clean
+
+== docs
+ M README.md
 ```
 
-Everything from the git command onwards goes to git unchanged. gitall's own options
-go before the git command.
+Then use the Git commands you already know: `gitall pull`, `gitall diff`,
+`gitall log --oneline`. gitall finds the repos, runs the command in each one, and
+labels the output.
 
-## Which repos
-
-- By default: every git repo directly inside the current folder; or, when you run it
-  from inside a repo (any subfolder), that repo and its sibling repos.
-- To fix the list (or its order), put a `.gitall` file in that folder. `gitall` looks for
-  it in the current folder and its parents, so it also works from inside one of the repos.
-  ```
-  # .gitall
-  Deck*                    # globs are case-sensitive
-  !Deck-old                # leave matching repos out
-  archive/*                # paths and path globs reach deeper repos
-  [tools]                  # a group: the lines below also belong to "tools"
-  scripts
-  build-tools  https://github.com/me/build-tools.git   # gitall clone fetches it if missing
-  []                       # ends the group
-  jobs = 8                 # default for -j
-  ```
-- `gitall -l` lists the repos it picked, with their numbers and state.
-  Linked worktrees of repos in the list are left out (list them in `.gitall` to include them).
-
-## Choosing repos for one command
-
-Put these **before** the git command.
-
-| Option | Meaning |
-|---|---|
-| `-r NAME` | The repo with that name, else repos whose name contains `NAME` (any case) |
-| `-r 'Deck*'` | A glob |
-| `-r 3`, `-r 2-5` | Positions in the list (see `gitall -l`) |
-| `-r tools` | A `[tools]` group from `.gitall` |
-| `-r :dirty` | Repos in a state (below) |
-| `-r a,b,c` | Several at once; `-r` can also be repeated |
-| `-x NAME` / `-r '!NAME'` | Leave repos out (names, globs, groups or states) |
-
-Names, globs and groups add up. States keep the repos that are in any of them, so
-`gitall -r tools -r :dirty,:ahead -l` shows the tools repos that have changes or unpushed commits.
-
-| State | Repos that... |
-|---|---|
-| `:dirty` / `:clean` | have / don't have uncommitted changes (incl. untracked files) |
-| `:staged`, `:modified`, `:untracked` | have staged, unstaged or untracked changes |
-| `:ahead`, `:behind`, `:diverged` | have unpushed commits, commits to pull, or both |
-| `:noupstream` | have no upstream branch (or it is gone) |
-| `:stash` | have stashed changes |
-| `:merging` | are in the middle of a merge, rebase, cherry-pick or revert |
-| `:detached` | are on a detached HEAD |
-| `:on=BRANCH` | are on that branch (globs allowed: `:on=feature/*`) |
-| `:has=BRANCH` | have that branch, locally or on a remote |
-
-```
-gitall -x Drafts pull                          # everything except Drafts
-gitall -r :ahead push
-gitall -r :has=feature/x switch feature/x
-gitall -r tools -l                             # check a choice before using it
-```
-
-## Other options
-
-| Option | Meaning |
-|---|---|
-| `-y` | Don't ask for confirmation (also allowed as the last argument) |
-| `-q` | Leave out repos with nothing to report |
-| `-j N` | Run fetch/pull/push/clone, and commands that only show things, in N repos at once |
-| `--prefix` | Start each output line with the repo's path: `gitall --prefix grep -n TODO` |
-| `-C DIR` | Start in `DIR` instead of the current folder |
-| `-c name=value`, `--no-pager`, `--literal-pathspecs`, ... | git's own options, passed on to git |
-| `-h` | Help |
-
-## Per-repo values
-
-In the arguments, `{repo}`, `{path}`, `{branch}`, `{upstream}` and `{default}` become each
-repo's folder name, path, current branch, upstream branch and default branch (main, master,
-...). The confirmation shows the command for each repo.
-
-```
-gitall switch {default}
-gitall tag {repo}-v1.0
-gitall commit -am "Weekly edits ({repo})"
-```
-
-In PowerShell, quote them: `'{repo}'`. Repos where a value doesn't exist (no upstream,
-detached HEAD) are skipped with the reason shown. git's `@{upstream}` is left alone.
-
-git commands run with `GITALL_REPO`, `GITALL_PATH`, `GITALL_I` and `GITALL_COUNT` set, so your
-own aliases can use them. A shell alias also runs in each repo (after a confirmation), which
-covers non-git commands: `git config --global alias.make '!make'`, then `gitall make`.
-
-## What's different from plain git
-
-- **status**: one line per repo (branch, ahead/behind, changes, merge/rebase in progress),
-  then the changed files of each repo (up to 10). A repo without an upstream is never shown
-  as "clean". Give any option (e.g. `gitall status -s`) to get plain `git status` instead.
-- **commit**: previews each repo's commit and asks once. Repos with nothing to commit are
-  skipped. Without `-m`, you write **one** message for all repos (`{repo}` works in it).
-  `--dry-run` only shows the preview. Amending a commit that is already pushed is flagged.
-- **push**: only repos with unpushed commits, after a preview and one confirmation. If the
-  remote has newer commits, it tells you to pull first. Force pushes are flagged.
-- **pull**: one line per repo (fast-forward / merged / rebased); up-to-date repos on one line;
-  repos without an upstream are skipped; conflicts are reported, not resolved.
-- **fetch**: one line per repo with what came in, and ahead/behind.
-- **switch / checkout \<branch\>**: shows which repos have the branch (locally or on the
-  remote), asks once, and switches those; repos without it are skipped.
-- **clone** with no URL: clones the repos listed with a URL in `.gitall` that are missing.
-- **Anything else** runs in every repo. If each repo prints one line, you get one aligned
-  line per repo; otherwise each repo's output under its name; repos with no output are left
-  out. Commands that change things show what will run and ask first.
-- `help`, `version`, `clone <url>`, `init <dir>` and `config --global` run once, not once per repo.
-- Relative files in options (`commit -F msg.txt`, `archive -o out.zip`) mean the file where
-  you are, not one inside each repo.
-- A repo in the middle of a merge or rebase, on a detached HEAD, or with a leftover
-  `index.lock` is skipped for commit/push/pull, with the reason shown.
-- One repo failing doesn't stop the others. At the end, failures are listed (identical errors
-  together) with a `retry:` command line for just those repos; the exit code is 1.
-  `grep` and `diff --quiet` exit like git: by whether anything matched or differed.
-
-## Examples
-
-```
-gitall -r 3 diff                                  # just the 3rd repo
-gitall add -- '*.tex'                             # git pathspecs work as usual
-gitall commit -m "Weekly edits ({repo})" --dry-run
-gitall commit -am "Weekly edits" -y
-gitall commit -m "Fix slides" -- 'slides/*.tex'   # commit only matching files, in every repo
-gitall -j 8 fetch                                 # then
-gitall -r :behind pull
-gitall -r :dirty status
-gitall switch -c feature/x                        # create a branch everywhere
-gitall --prefix grep -n TODO
-```
+[Install](#install) · [Get started](#get-started) · [Choose repos](#choose-repos) ·
+[Configuration](#configuration) · [Reference](docs/reference.md)
 
 ## Install
 
-Needs Python 3.8+ and git; `gitall.py` is a single file with no other dependencies.
+Requires **Python 3.8+** and **Git 2.15+** on Windows, macOS, or Linux.
+Commands such as `switch` need a Git version that supports them (2.23+).
 
-- **Windows:** add the folder containing `gitall.py` and `gitall.cmd` to your `PATH`, then type
-  `gitall ...` in PowerShell or cmd.
-- **macOS / Linux:** `chmod +x gitall.py && ln -s "$PWD/gitall.py" ~/.local/bin/gitall`
-  (or any folder on your `PATH`).
-- Or run it directly: `python path/to/gitall.py status`.
+Install with [pipx](https://pipx.pypa.io/stable/how-to/install-pipx.html):
 
-Renaming the file renames the tool: `multigit.py` reads `.multigit` and calls itself multigit.
-
-## Tests
-
-The tests build throwaway repos, each with a bare repo as its remote (standing in for a
-hosted remote such as Overleaf), and run gitall against them. They need pytest:
-
+```sh
+pipx install git+https://github.com/jincechen/gitall
 ```
+
+gitall is a single Python file with no other runtime dependencies. You can also
+[download and run it directly](docs/reference.md#install-without-pipx).
+
+## Get started
+
+Go to the folder containing your repositories:
+
+```sh
+cd ~/projects
+gitall status
+```
+
+No configuration is needed. gitall uses the repos directly inside that folder.
+It also finds sibling repos when you run it from inside a repo; see
+[discovery rules](docs/reference.md#selecting-repos) for details. A
+[`.gitall` file](#configuration) overrides discovery.
+Run `gitall -l` to check the list before running a command.
+
+For a typical edit, review the changes, commit, and push:
+
+```sh
+gitall diff
+gitall commit -am "Fix typos"
+gitall push
+```
+
+`commit` previews the changes in each repo and asks for confirmation once. Repos
+with nothing to commit are skipped. As with Git, `-a` includes changes to tracked
+files; add new files with `gitall add .` first. Plain `gitall push` previews and
+pushes repos with unpushed commits.
+
+To get updates, run `gitall pull`. To refresh the ahead/behind counts without
+merging, run `gitall fetch`.
+
+Put gitall's options **before** the Git command. Options after the command belong
+to Git:
+
+```sh
+gitall -r api,web log -3 --oneline
+```
+
+## Choose repos
+
+Use `-r` to select repos and `-x` to exclude them:
+
+| Task | Command |
+| --- | --- |
+| List repos with their numbers and state | `gitall -l` |
+| Pull updates for two repos | `gitall -r api,web pull` |
+| Pull updates for all repos except one | `gitall -x docs pull` |
+| Review repos with uncommitted changes | `gitall -r :dirty diff` |
+| Select repos by name pattern | `gitall -r 'api*' status` |
+
+You can also select by group, list number, or branch. See the
+[selection reference](docs/reference.md#selecting-repos) for all selectors and how
+to combine them.
+
+## Configuration
+
+To keep a specific set of repos, create a `.gitall` file in their parent folder.
+Start with one repo name or path per line:
+
+```text
+api
+web
+docs
+```
+
+gitall uses the nearest `.gitall` file in the current folder or its parents, so
+the same selection works from subfolders too. Paths are relative to that file.
+
+Add a group when you often work on a subset together:
+
+```text
+docs
+[app]
+api
+web
+```
+
+Now `gitall -r app pull` updates `api` and `web`; `gitall pull` still updates all
+three. The [configuration reference](docs/reference.md#the-gitall-file) covers
+patterns, exclusions, clone URLs, and parallel jobs.
+
+## What to expect
+
+Commit, push, pull, branch changes, and other commands that change things normally
+show a preview and ask once. Use `-y` to skip confirmation, including in scripts.
+Ordinary `add` runs without asking, but warns before staging a conflicted file
+that still contains conflict markers.
+
+For commit, push, and pull, gitall skips repos in a merge or rebase, on a detached
+HEAD, or with an `index.lock` file, and explains why. It reports pull conflicts
+for you to resolve.
+
+If a command fails in one repo, gitall continues with the others, reports the
+failures, and exits with status 1. Where a retry is possible, it prints a command
+for the affected repos.
+
+## More usage
+
+The [command reference](docs/reference.md) includes all options, command-specific
+behavior, and examples for:
+
+- [Using different values in each repo](docs/reference.md#per-repo-values), such as
+  `gitall switch '{default}'` to return each repo to its default branch.
+- [Running commands in parallel](docs/reference.md#options) with `-j`.
+- [Using Git aliases and hooks](docs/reference.md#aliases-and-hooks).
+- [Quoting arguments in your shell](docs/reference.md#shell-quoting).
+
+Run `gitall --help` for help in the terminal. See the [changelog](CHANGELOG.md)
+for release history.
+
+## Development
+
+From a clone of this repo:
+
+```sh
+python -m venv .venv
+```
+
+Activate the environment (`source .venv/bin/activate` on macOS/Linux, or
+`.venv\Scripts\Activate.ps1` in PowerShell), then run:
+
+```sh
 python -m pip install pytest
 python -m pytest
 ```
+
+Use `python3` or `py` if that is how you invoke Python 3 on your system. The tests
+use temporary repositories and local bare remotes. CI runs on Linux, macOS, and
+Windows.
+
+## License
+
+[MIT](LICENSE).
